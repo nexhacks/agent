@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Video Review</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg: #0f1117;
+        --panel: #151923;
+        --border: #2b3140;
+        --text: #e6e9f2;
+        --muted: #9aa3b2;
+        --action: #ff5e5e;
+        --transcript: #6ee7a8;
+        --accent: #4aa3ff;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", sans-serif;
+        background: radial-gradient(circle at top, #1b2233, var(--bg));
+        color: var(--text);
+      }
+      header {
+        padding: 20px 28px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+      header h1 {
+        font-size: 20px;
+        margin: 0;
+        letter-spacing: 0.6px;
+      }
+      .status {
+        color: var(--muted);
+        font-size: 14px;
+      }
+      main {
+        display: grid;
+        grid-template-columns: minmax(320px, 1.2fr) minmax(280px, 0.8fr);
+        gap: 18px;
+        padding: 20px 28px 28px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 16px;
+        box-shadow: 0 12px 30px rgba(8, 10, 16, 0.35);
+      }
+      video {
+        width: 100%;
+        border-radius: 12px;
+        background: #05060a;
+      }
+      .upload {
+        display: flex;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+      input[type="file"] {
+        flex: 1;
+        padding: 8px;
+        border-radius: 10px;
+        border: 1px dashed var(--border);
+        color: var(--muted);
+        background: transparent;
+      }
+      button {
+        padding: 8px 14px;
+        border-radius: 10px;
+        border: 1px solid var(--accent);
+        background: var(--accent);
+        color: #0b0d14;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      .events {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        max-height: 70vh;
+        overflow-y: auto;
+      }
+      .event {
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #101622;
+        font-size: 14px;
+        line-height: 1.4;
+      }
+      .event .time {
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 4px;
+      }
+      .event.action {
+        border-left: 3px solid var(--action);
+      }
+      .event.transcript {
+        border-left: 3px solid var(--transcript);
+      }
+      .legend {
+        display: flex;
+        gap: 12px;
+        font-size: 13px;
+        color: var(--muted);
+        margin-bottom: 10px;
+      }
+      .legend span {
+        display: inline-flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+      }
+      .dot.action {
+        background: var(--action);
+      }
+      .dot.transcript {
+        background: var(--transcript);
+      }
+      @media (max-width: 900px) {
+        main {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Video Review</h1>
+      <div class="status" id="status">Upload a video to start.</div>
+    </header>
+    <main>
+      <section class="panel">
+        <form id="upload-form" class="upload">
+          <input type="file" id="file-input" accept="video/*" />
+          <button type="submit">Upload</button>
+        </form>
+        <video id="video" controls playsinline></video>
+      </section>
+      <section class="panel">
+        <div class="legend">
+          <span><span class="dot action"></span>Action</span>
+          <span><span class="dot transcript"></span>Transcript</span>
+        </div>
+        <div class="events" id="events"></div>
+      </section>
+    </main>
+    <script>
+      const uploadForm = document.getElementById("upload-form");
+      const fileInput = document.getElementById("file-input");
+      const statusEl = document.getElementById("status");
+      const video = document.getElementById("video");
+      const eventsEl = document.getElementById("events");
+
+      let events = [];
+      let nextIndex = 0;
+      let pollTimer = null;
+      let sinceId = 0;
+      let activeVideoId = null;
+
+      function formatTime(sec) {
+        const m = Math.floor(sec / 60);
+        const s = Math.floor(sec % 60);
+        return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+      }
+
+      function resetEvents() {
+        events = [];
+        nextIndex = 0;
+        sinceId = 0;
+        eventsEl.innerHTML = "";
+      }
+
+      function renderUpTo(timeSec) {
+        while (nextIndex < events.length && events[nextIndex].offset_sec <= timeSec) {
+          const ev = events[nextIndex];
+          const el = document.createElement("div");
+          el.className = `event ${ev.kind.includes("transcript") ? "transcript" : "action"}`;
+          const time = document.createElement("div");
+          time.className = "time";
+          time.textContent = formatTime(ev.offset_sec);
+          const body = document.createElement("div");
+          body.textContent = ev.text;
+          el.append(time, body);
+          eventsEl.appendChild(el);
+          eventsEl.scrollTop = eventsEl.scrollHeight;
+          nextIndex += 1;
+        }
+      }
+
+      async function pollEvents() {
+        if (!activeVideoId) return;
+        try {
+          const res = await fetch(`/api/events?video_id=${activeVideoId}&since_id=${sinceId}`);
+          const data = await res.json();
+          if (data.events && data.events.length) {
+            data.events.forEach((ev) => {
+              events.push(ev);
+              sinceId = Math.max(sinceId, ev.id);
+            });
+            events.sort((a, b) => a.offset_sec - b.offset_sec);
+          }
+        } catch (err) {
+          console.error(err);
+        }
+      }
+
+      uploadForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const file = fileInput.files[0];
+        if (!file) return;
+        const form = new FormData();
+        form.append("file", file);
+        statusEl.textContent = "Uploading...";
+        const res = await fetch("/upload", { method: "POST", body: form });
+        const data = await res.json();
+        activeVideoId = data.video_id;
+        video.src = `/video/${activeVideoId}`;
+        resetEvents();
+        statusEl.textContent = "Processing video...";
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = setInterval(async () => {
+          await pollEvents();
+          const videosRes = await fetch("/api/videos");
+          const videosData = await videosRes.json();
+          const current = videosData.videos.find((v) => v.id === activeVideoId);
+          statusEl.textContent = current ? `Status: ${current.status}` : "Status: unknown";
+        }, 1500);
+      });
+
+      video.addEventListener("timeupdate", () => {
+        renderUpTo(video.currentTime);
+      });
+
+      video.addEventListener("seeked", () => {
+        eventsEl.innerHTML = "";
+        nextIndex = 0;
+        renderUpTo(video.currentTime);
+      });
+    </script>
+  </body>
+</html>

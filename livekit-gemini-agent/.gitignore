@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+
+# Packaging/build
+build/
+dist/
+*.egg-info/
+
+# Test/cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment files
+.env
+.env.*
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log
+KMS/logs/
+
+# Runtime data
+uploads/
+*.db
+*.db-shm
+*.db-wal
