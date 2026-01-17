@@ -308,8 +308,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    env_path = os.path.join(os.path.dirname(__file__), ".env.local")
-    load_dotenv(env_path)
+    base_dir = os.path.dirname(__file__)
+    load_dotenv(os.path.join(base_dir, ".env"))
+    load_dotenv(os.path.join(base_dir, ".env.local"), override=True)
 
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     open_video_db().close()

@@ -14,8 +14,9 @@ from livekit.plugins import (
     silero,
 )
 
-ENV_PATH = os.path.join(os.path.dirname(__file__), ".env.local")
-load_dotenv(ENV_PATH)
+BASE_DIR = os.path.dirname(__file__)
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+load_dotenv(os.path.join(BASE_DIR, ".env.local"), override=True)
 AGENT_NAME = os.getenv("LIVEKIT_AGENT_NAME", "assistant")
 
 

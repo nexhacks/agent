@@ -164,8 +164,9 @@ def _choose_camera_index() -> int:
 
 
 async def main():
-    env_path = os.path.join(os.path.dirname(__file__), ".env.local")
-    load_dotenv(env_path)
+    base_dir = os.path.dirname(__file__)
+    load_dotenv(os.path.join(base_dir, ".env"))
+    load_dotenv(os.path.join(base_dir, ".env.local"), override=True)
     url = require_env("LIVEKIT_URL")
     token = build_token()
     agent_name = os.getenv("LIVEKIT_AGENT_NAME", "assistant")
