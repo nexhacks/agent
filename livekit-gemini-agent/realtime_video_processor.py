@@ -35,6 +35,10 @@ AUDIO_CHANNELS = 1  # Mono
 AUDIO_FRAME_DURATION_MS = 20  # 20ms frames
 AUDIO_SAMPLES_PER_FRAME = int(AUDIO_SAMPLE_RATE * AUDIO_FRAME_DURATION_MS / 1000)
 
+# Video throttling - reduce frame rate to avoid overwhelming the Realtime API
+# 5-10 fps is plenty for realtime reasoning
+MAX_VIDEO_FPS = float(os.getenv("MAX_VIDEO_FPS", "5"))
+
 
 def _build_token(room_name: str, identity: str) -> str:
     if api is None:
@@ -136,25 +140,39 @@ class RealtimeVideoProcessor:
                     print(f"[{self.video_id}] Failed to signal agent: {e}")
 
     async def _run(self):
+        import traceback
+        print(f"[{self.video_id}] RealtimeVideoProcessor._run() starting...")
+
         env_path = os.path.join(os.path.dirname(__file__), ".env.local")
         load_dotenv(env_path)
+        print(f"[{self.video_id}] Loaded env from: {env_path}")
 
         url = os.environ.get("LIVEKIT_URL")
         if not url:
-            print(f"[{self.video_id}] Missing LIVEKIT_URL")
+            print(f"[{self.video_id}] FATAL: Missing LIVEKIT_URL in environment")
             return
+        print(f"[{self.video_id}] LIVEKIT_URL: {url[:30]}...")
 
         agent_name = os.getenv("LIVEKIT_AGENT_NAME", "assistant")
         speed_multiplier = float(os.getenv("VIDEO_SPEED_MULTIPLIER", "1.0"))
+        print(f"[{self.video_id}] Agent name: {agent_name}, speed: {speed_multiplier}")
 
-        token = _build_token(self.room_name, self.identity)
+        try:
+            token = _build_token(self.room_name, self.identity)
+            print(f"[{self.video_id}] Token built for room: {self.room_name}")
+        except Exception as e:
+            print(f"[{self.video_id}] FATAL: Failed to build token: {e}")
+            traceback.print_exc()
+            return
 
         # Open video file
+        print(f"[{self.video_id}] Opening video file: {self.video_path}")
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
-            print(f"[{self.video_id}] Failed to open video: {self.video_path}")
+            print(f"[{self.video_id}] FATAL: Failed to open video: {self.video_path}")
             update_video_status(open_video_db(), self.video_id, "error")
             return
+        print(f"[{self.video_id}] Video file opened successfully")
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -194,8 +212,10 @@ class RealtimeVideoProcessor:
                     pass
 
         # Connect to room
+        print(f"[{self.video_id}] Creating LiveKit Room object...")
         self._room = rtc.Room()
         conn = open_video_db()
+        print(f"[{self.video_id}] Database connection opened")
 
         # Listen for transcriptions from the agent
         @self._room.on("transcription_received")
@@ -221,8 +241,9 @@ class RealtimeVideoProcessor:
                 print(f"[{self.video_id}] Action @ {offset:.1f}s: {seg.text.strip()[:50]}...")
 
         try:
+            print(f"[{self.video_id}] Connecting to LiveKit room: {self.room_name}...")
             await self._room.connect(url, token, rtc.RoomOptions(auto_subscribe=True))
-            print(f"[{self.video_id}] Connected to LiveKit room: {self.room_name}")
+            print(f"[{self.video_id}] CONNECTED to LiveKit room: {self.room_name}")
 
             # Register RPC handlers for pause/resume coordination
             @self._room.local_participant.register_rpc_method("pause_stream")
@@ -292,6 +313,7 @@ class RealtimeVideoProcessor:
             start_time = asyncio.get_event_loop().time()
 
             update_video_status(conn, self.video_id, "streaming")
+            print(f"[{self.video_id}] Status updated to 'streaming', beginning video stream...")
 
             # Audio streaming task
             async def stream_audio():
@@ -333,6 +355,12 @@ class RealtimeVideoProcessor:
                 # Catch-up speed when resuming from pause (10x normal)
                 catchup_multiplier = 10.0
 
+                # Throttle video to MAX_VIDEO_FPS to avoid overwhelming Realtime API
+                target_fps = min(fps, MAX_VIDEO_FPS)
+                frame_skip = max(1, int(fps / target_fps))
+                print(f"[{self.video_id}] Throttling video: {fps:.1f}fps -> {target_fps:.1f}fps (skip every {frame_skip} frames)")
+
+                last_progress_log = 0
                 while not self._stop_event.is_set():
                     # Wait if paused
                     if self._paused:
@@ -342,6 +370,12 @@ class RealtimeVideoProcessor:
                         continue
 
                     ok, frame_bgr = await asyncio.to_thread(cap.read)
+
+                    # Log progress every 10 seconds of video time
+                    if int(self._video_offset) >= last_progress_log + 10:
+                        last_progress_log = int(self._video_offset)
+                        elapsed_real = asyncio.get_event_loop().time() - start_time
+                        print(f"[{self.video_id}] Progress: {self._video_offset:.1f}s video / {elapsed_real:.1f}s real time")
 
                     if not ok:
                         print(f"[{self.video_id}] Video complete")
@@ -353,6 +387,10 @@ class RealtimeVideoProcessor:
                     # Update video offset
                     frame_count += 1
                     self._video_offset = frame_count / fps
+
+                    # Skip frames to throttle video rate (reduces WebSocket pressure)
+                    if frame_count % frame_skip != 0:
+                        continue
 
                     # Resize if needed
                     if frame_bgr.shape[1] != width or frame_bgr.shape[0] != height:

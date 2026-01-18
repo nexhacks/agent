@@ -105,18 +105,23 @@ def create_realtime_model(provider: str, video_processing_mode: bool = False):
         voice = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
         modalities = ["text"]
 
-        # OpenAI turn detection config for video processing
+        # For video processing: enable turn detection so the model auto-responds
+        # to activity in the video/audio stream. Use higher silence duration to
+        # let scenes play out before responding.
         if video_processing_mode:
+            turn_detection_config = TurnDetection(
+                type="server_vad",
+                threshold=0.6,  # Slightly higher threshold to reduce false triggers
+                prefix_padding_ms=500,
+                silence_duration_ms=1500,  # Wait 1.5s of silence before responding
+            )
+        else:
             turn_detection_config = TurnDetection(
                 type="server_vad",
                 threshold=0.5,
                 prefix_padding_ms=300,
                 silence_duration_ms=500,
-                create_response=False,
-                interrupt_response=False,
             )
-        else:
-            turn_detection_config = None
 
         return openai.realtime.RealtimeModel(
             model=model,
@@ -253,7 +258,13 @@ server = AgentServer(port=0)
 
 @server.rtc_session(agent_name=AGENT_NAME)
 async def my_agent(ctx: agents.JobContext):
-    print(f"Agent session started in room: {ctx.room.name} (agent={AGENT_NAME}, provider={LLM_PROVIDER})")
+    print(f"\n{'='*60}")
+    print(f"AGENT SESSION STARTING")
+    print(f"Room: {ctx.room.name}")
+    print(f"Agent: {AGENT_NAME}")
+    print(f"Provider: {LLM_PROVIDER}")
+    print(f"Participants: {list(ctx.room.remote_participants.keys())}")
+    print(f"{'='*60}\n")
 
     # Validate API key based on provider
     if LLM_PROVIDER == "gemini":
@@ -301,6 +312,7 @@ async def my_agent(ctx: agents.JobContext):
             f"(model={agent._realtime_model}, modalities={agent._realtime_modalities})."
         )
 
+    print(f"Starting AgentSession (video_input=True, audio_input={is_video_room})...")
     await session.start(
         room=ctx.room,
         agent=agent,
@@ -313,6 +325,7 @@ async def my_agent(ctx: agents.JobContext):
             close_on_disconnect=False,  # Keep session alive after video streamer leaves
         ),
     )
+    print(f"AgentSession started successfully!")
     session.output.transcription = ConsoleTextOutput(
         label="console",
         next_in_chain=session.output.transcription,
@@ -323,6 +336,9 @@ async def my_agent(ctx: agents.JobContext):
     loop = asyncio.get_running_loop()
     cooldown_until = 0.0
     consecutive_errors = 0
+
+    # Activity tracking - only summarize if something happened
+    activity_since_last_summary = {"transcripts": 0, "frames": 0}
 
     # Colors for console output
     green = "\033[32m"
@@ -335,8 +351,11 @@ async def my_agent(ctx: agents.JobContext):
             @session.llm.on("openai_server_event_received")
             def _on_raw_event(event):
                 event_type = event.get("type", "unknown")
-                # Only log error-related events and response.done with non-completed status
-                if event_type == "error":
+                # Log session lifecycle events
+                if event_type in ("session.created", "session.updated"):
+                    print(f"{green}[SESSION] {event_type}{reset_color}")
+                # Log error-related events
+                elif event_type == "error":
                     print(f"{yellow}[RAW EVENT] error: {event}{reset_color}")
                 elif event_type == "response.done":
                     response = event.get("response", {})
@@ -344,6 +363,11 @@ async def my_agent(ctx: agents.JobContext):
                     if status != "completed":
                         print(f"{yellow}[RAW EVENT] response.done (status={status}):{reset_color}")
                         print(f"{yellow}  status_details: {response.get('status_details')}{reset_color}")
+                    else:
+                        # Log successful responses briefly
+                        output = response.get("output", [])
+                        if output:
+                            print(f"{green}[RESPONSE] completed with {len(output)} output(s){reset_color}")
 
     # Log user transcripts (audio from video) for video rooms and publish to frontend
     @session.on("user_input_transcribed")
@@ -354,6 +378,9 @@ async def my_agent(ctx: agents.JobContext):
             return
         text = transcript.transcript.strip()
         ts = datetime.now()
+
+        # Track activity for gating summarization
+        activity_since_last_summary["transcripts"] += 1
 
         # Log final transcripts to the database
         if transcript.is_final and event_logger:
@@ -428,8 +455,16 @@ async def my_agent(ctx: agents.JobContext):
     video_ended_event = asyncio.Event()  # Signals video processing is done
 
     @session.on("close")
-    def _on_close(_):
+    def _on_close(reason):
+        elapsed = datetime.now().timestamp() - session_start_time
+        print(f"{yellow}[SESSION CLOSED] after {elapsed:.1f}s - reason: {reason}{reset_color}")
         stop_event.set()
+
+    # Track room connection state
+    @ctx.room.on("disconnected")
+    def _on_room_disconnected():
+        elapsed = datetime.now().timestamp() - session_start_time
+        print(f"{yellow}[ROOM DISCONNECTED] after {elapsed:.1f}s{reset_color}")
 
     # Register RPC handler for video completion signal from video processor
     @ctx.room.local_participant.register_rpc_method("video_complete")
@@ -547,8 +582,10 @@ async def my_agent(ctx: agents.JobContext):
                 print(f"Realtime request: {instructions}")
             try:
                 # Generate reply while stream is paused, disable interruptions
+                # (turn_detection is disabled in video mode, so this works)
                 speech_handle = session.generate_reply(
                     instructions=instructions,
+                    allow_interruptions=False,
                 )
                 # Wait for the response to fully complete
                 await speech_handle
@@ -582,19 +619,53 @@ async def my_agent(ctx: agents.JobContext):
             await asyncio.sleep(short_interval)
 
     async def long_loop():
+        print(f"{green}Starting scene analysis loop (interval={long_interval}s){reset_color}")
+        request_errors = 0
         while not stop_event.is_set() and not video_ended_event.is_set():
+            # Gate on activity - skip if nothing happened since last summary
+            total_activity = activity_since_last_summary["transcripts"]
+            if total_activity == 0:
+                print(f"{yellow}No activity since last summary, skipping{reset_color}")
+                await asyncio.sleep(long_interval)
+                continue
+
+            print(f"{green}Activity detected ({total_activity} transcripts), summarizing...{reset_color}")
+
             try:
-                await run_reply(
-                    instructions=(
-                        "Summarize the recent activity: what actions were taken? "
-                        "What was said? Who interacted with whom and how? "
-                        "Note any notable events, statements, or behaviors. "
-                        "Use third-person ('the officer approached...', 'the individual stated...'). "
-                        "If no activity occurred, say: No significant activity detected."
+                # Add timeout watchdog - cancel if no response in 10s
+                await asyncio.wait_for(
+                    run_reply(
+                        instructions=(
+                            "Summarize the recent activity: what actions were taken? "
+                            "What was said? Who interacted with whom and how? "
+                            "Note any notable events, statements, or behaviors. "
+                            "Use third-person ('the officer approached...', 'the individual stated...'). "
+                            "If no activity occurred, say: No significant activity detected."
+                        ),
+                        max_tokens=220,
                     ),
-                    max_tokens=220,
+                    timeout=10.0,
                 )
+                request_errors = 0  # Reset on success
+                # Reset activity counter after successful summary
+                activity_since_last_summary["transcripts"] = 0
+                # Post-request delay to let WebRTC connection stabilize
+                await asyncio.sleep(2.0)
+            except asyncio.TimeoutError:
+                print(f"{yellow}Summarization timed out after 10s, resetting...{reset_color}")
+                await reset_chat_ctx()
+                request_errors += 1
+                await asyncio.sleep(2.0)
+                continue
             except Exception as exc:
+                err_str = str(exc).lower()
+                if "requests" in err_str:
+                    request_errors += 1
+                    # Fast exponential backoff for transport errors (0.2s, 0.5s, 1s, 2s, max 5s)
+                    backoff = min(0.2 * (2.5 ** (request_errors - 1)), 5.0)
+                    print(f"{yellow}Transport error, backing off {backoff:.1f}s (attempt {request_errors}){reset_color}")
+                    await asyncio.sleep(backoff)
+                    continue  # Don't break, try again
                 print(f"Long loop stopped: {exc}")
                 break
             await asyncio.sleep(long_interval)
@@ -602,6 +673,7 @@ async def my_agent(ctx: agents.JobContext):
     async def interactive_chat_loop():
         """Wait for video to end, then enable interactive text chat."""
         await video_ended_event.wait()
+
 
         # Update agent instructions for Q&A mode
         qa_instructions = (
@@ -623,9 +695,19 @@ async def my_agent(ctx: agents.JobContext):
         # Keep session alive for text interaction - the agent will auto-respond to text input
         await stop_event.wait()
 
+    async def heartbeat():
+        """Periodic heartbeat to show the agent is still running."""
+        count = 0
+        while not stop_event.is_set() and not video_ended_event.is_set():
+            count += 1
+            elapsed = datetime.now().timestamp() - session_start_time
+            print(f"{yellow}[Heartbeat] Agent alive - {elapsed:.0f}s elapsed, video_ended={video_ended_event.is_set()}{reset_color}")
+            await asyncio.sleep(15)
+
     tasks = []
     tasks.append(asyncio.create_task(tail_mic_transcripts()))
     if is_video_room:
+        tasks.append(asyncio.create_task(heartbeat()))
         if short_interval > 0:
             tasks.append(asyncio.create_task(short_loop()))
         if long_interval > 0:

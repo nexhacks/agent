@@ -162,16 +162,23 @@
         background: #101622;
         font-size: 14px;
         line-height: 1.4;
-        opacity: 0;
-        animation: fadeIn 0.3s ease forwards;
+        color: var(--text);
+        opacity: 1;
+      }
+      .event.new {
+        animation: fadeIn 0.3s ease;
       }
       @keyframes fadeIn {
-        to { opacity: 1; }
+        from { opacity: 0; background: rgba(74, 163, 255, 0.3); }
+        to { opacity: 1; background: #101622; }
       }
       .event .time {
         font-size: 12px;
         color: var(--muted);
         margin-bottom: 4px;
+      }
+      .event > div:last-child {
+        color: var(--text);
       }
       .event.action {
         border-left: 3px solid var(--action);
@@ -183,12 +190,14 @@
       .event.transcript {
         border-left: 3px solid var(--transcript);
       }
-      .event.new {
-        animation: highlight 1s ease;
+      .event.no_activity {
+        border-left: 3px solid var(--border);
+        opacity: 0.6;
+        font-style: italic;
+        background: transparent;
       }
-      @keyframes highlight {
-        0% { background: rgba(74, 163, 255, 0.3); }
-        100% { background: #101622; }
+      .event.no_activity .time {
+        display: none;
       }
       .mode-indicator {
         font-size: 11px;
@@ -263,6 +272,7 @@
       function getEventClass(kind) {
         if (kind.includes("transcript")) return "transcript";
         if (kind.includes("realtime")) return "action action_realtime";
+        if (kind.includes("no_activity")) return "no_activity";
         return "action";
       }
 

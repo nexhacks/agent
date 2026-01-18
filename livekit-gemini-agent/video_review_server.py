@@ -37,6 +37,9 @@ PROVIDER = os.getenv("VIDEO_LLM_PROVIDER", "openai").lower()
 # Use the OpenAI Realtime API instead of frame-by-frame processing
 USE_REALTIME_API = os.getenv("USE_REALTIME_API", "1") == "1"
 
+# Use the new SSE streaming processor (simpler, more reliable)
+USE_STREAM_PROCESSOR = os.getenv("USE_STREAM_PROCESSOR", "1") == "1"
+
 # Rate limiting: tokens per minute budget (leave headroom under 200k limit)
 TPM_BUDGET = int(os.getenv("VIDEO_TPM_BUDGET", "150000"))
 # Estimated tokens per image (reduced due to compression - 512x512 JPEG ~500 tokens)
@@ -345,14 +348,40 @@ def _process_actions(video_id: str, video_path: str) -> None:
 
 def _process_video_realtime(video_id: str, video_path: str) -> None:
     """Process video using the OpenAI Realtime API via LiveKit streaming."""
-    from realtime_video_processor import RealtimeVideoProcessor
+    import traceback
+
+    print(f"[{video_id}] Starting realtime video processing...")
+    print(f"[{video_id}] Video path: {video_path}")
+    print(f"[{video_id}] File exists: {os.path.exists(video_path)}")
+
+    try:
+        from realtime_video_processor import RealtimeVideoProcessor
+        print(f"[{video_id}] RealtimeVideoProcessor imported successfully")
+    except Exception as exc:
+        print(f"[{video_id}] FAILED to import RealtimeVideoProcessor: {exc}")
+        traceback.print_exc()
+        raise
 
     async def _run():
-        processor = RealtimeVideoProcessor(video_id, video_path)
-        await processor.start()
-        await processor.wait()
+        try:
+            print(f"[{video_id}] Creating RealtimeVideoProcessor...")
+            processor = RealtimeVideoProcessor(video_id, video_path)
+            print(f"[{video_id}] Starting processor...")
+            await processor.start()
+            print(f"[{video_id}] Processor started, waiting for completion...")
+            await processor.wait()
+            print(f"[{video_id}] Processor completed")
+        except Exception as exc:
+            print(f"[{video_id}] ERROR in realtime processing: {exc}")
+            traceback.print_exc()
+            raise
 
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        print(f"[{video_id}] FATAL: asyncio.run failed: {exc}")
+        traceback.print_exc()
+        raise
 
 
 def _process_video_legacy(video_id: str, video_path: str) -> None:
@@ -422,13 +451,30 @@ def process_video(video_id: str, video_path: str) -> None:
 
 
 class VideoHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        """Suppress default HTTP request logging."""
+        pass
+
+    def _send_cors_headers(self) -> None:
+        """Add CORS headers for cross-origin requests."""
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
     def _send_json(self, payload: dict, status: int = 200) -> None:
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self._send_cors_headers()
         self.end_headers()
         self.wfile.write(data)
+
+    def do_OPTIONS(self) -> None:
+        """Handle CORS preflight requests."""
+        self.send_response(200)
+        self._send_cors_headers()
+        self.end_headers()
 
     def _send_file(self, path: str) -> None:
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
@@ -475,6 +521,32 @@ class VideoHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
+    def _stream_sse(self, video_id: str) -> None:
+        """Stream Server-Sent Events for a video being processed."""
+        from video_stream_processor import get_stream_processor
+
+        processor = get_stream_processor(video_id)
+        if not processor:
+            self.send_error(404, "No active stream for this video")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self._send_cors_headers()
+        self.end_headers()
+
+        try:
+            for event in processor.events():
+                sse_data = event.to_sse()
+                self.wfile.write(sse_data.encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            print(f"[{video_id}] SSE client disconnected")
+        except Exception as e:
+            print(f"[{video_id}] SSE stream error: {e}")
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
@@ -494,6 +566,11 @@ class VideoHandler(BaseHTTPRequestHandler):
             payload = {"events": list_events(conn, video_id, since_id)}
             conn.close()
             self._send_json(payload)
+            return
+        # SSE streaming endpoint
+        if parsed.path.startswith("/api/stream/"):
+            video_id = parsed.path.split("/api/stream/")[1]
+            self._stream_sse(video_id)
             return
         if parsed.path.startswith("/video/"):
             video_id = parsed.path.split("/video/")[1]
@@ -534,9 +611,22 @@ class VideoHandler(BaseHTTPRequestHandler):
         conn = open_video_db()
         insert_video(conn, video_id, os.path.basename(file_item.filename), duration)
         conn.close()
-        thread = threading.Thread(target=process_video, args=(video_id, dst_path), daemon=True)
-        thread.start()
-        self._send_json({"video_id": video_id})
+
+        # Use the new stream processor if enabled
+        if USE_STREAM_PROCESSOR:
+            from video_stream_processor import start_stream_processing
+            print(f"[{video_id}] Using SSE stream processor")
+            start_stream_processing(video_id, dst_path)
+            # Return video_id with stream_url for frontend to connect
+            self._send_json({
+                "video_id": video_id,
+                "stream_url": f"/api/stream/{video_id}",
+            })
+        else:
+            # Legacy processing
+            thread = threading.Thread(target=process_video, args=(video_id, dst_path), daemon=True)
+            thread.start()
+            self._send_json({"video_id": video_id})
 
 
 def main() -> None:
@@ -552,14 +642,18 @@ def main() -> None:
     print("=" * 50)
     print("VIDEO REVIEW SERVER CONFIGURATION")
     print("=" * 50)
-    print(f"Processing mode: {'Realtime API' if USE_REALTIME_API else 'Frame-by-frame (legacy)'}")
+    if USE_STREAM_PROCESSOR:
+        stream_interval = float(os.getenv("STREAM_FRAME_INTERVAL", "3"))
+        print(f"Processing mode: SSE Stream Processor (recommended)")
+        print(f"  - Frame analysis interval: {stream_interval}s")
+        print(f"  - Audio+Video combined analysis")
+        print(f"  - SSE streaming to frontend")
+    elif USE_REALTIME_API:
+        print(f"Processing mode: LiveKit Realtime API (experimental)")
+    else:
+        print(f"Processing mode: Frame-by-frame (legacy)")
     print(f"Vision model: {MODEL_NAME}")
     print(f"Transcription model: {TRANSCRIBE_MODEL}")
-    print(f"LLM provider: {PROVIDER}")
-    print(f"Frame intervals: short={SHORT_INTERVAL}s, long={LONG_INTERVAL}s")
-    print(f"Image compression: {IMAGE_MAX_WIDTH}x{IMAGE_MAX_HEIGHT} @ quality={IMAGE_QUALITY}")
-    print(f"Est. tokens/image: {TOKENS_PER_IMAGE}")
-    print(f"Rate limit budget: {TPM_BUDGET} tokens/min")
     print("=" * 50)
 
     server = ThreadingHTTPServer((args.host, args.port), VideoHandler)
