@@ -1,8 +1,14 @@
 [project]
 name = "livekit-gemini-agent"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
+    "workers-py",
+    "workers-runtime-sdk",
+]
+
+[project.optional-dependencies]
+server = [
     "livekit-agents[openai,google,silero,images]~=1.3",
     "livekit-plugins-noise-cancellation~=0.2",
     "livekit>=1.0.0",
