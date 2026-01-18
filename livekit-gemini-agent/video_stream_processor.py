@@ -387,17 +387,11 @@ class VideoStreamProcessor:
 
         # YAMNet expects 16kHz audio
         if sample_rate != 16000:
-            try:
-                import resampy
-                print(f"[{self.video_id}] Resampling audio from {sample_rate}Hz to 16000Hz...")
-                audio = resampy.resample(audio, sample_rate, 16000)
-                sample_rate = 16000
-            except ImportError:
-                print(f"[{self.video_id}] resampy not available, using scipy for resampling")
-                from scipy import signal
-                num_samples = int(len(audio) * 16000 / sample_rate)
-                audio = signal.resample(audio, num_samples)
-                sample_rate = 16000
+            from scipy import signal
+            print(f"[{self.video_id}] Resampling audio from {sample_rate}Hz to 16000Hz...")
+            num_samples = int(len(audio) * 16000 / sample_rate)
+            audio = signal.resample(audio, num_samples)
+            sample_rate = 16000
 
         # Process in sliding windows
         window_samples = int(sample_rate * YAMNET_WINDOW_SEC)

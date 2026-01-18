@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import base64
-import cgi
 import json
 import mimetypes
 import os
@@ -9,6 +8,7 @@ import re
 import subprocess
 import threading
 import uuid
+from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -125,6 +125,48 @@ def _encode_frame_bgr(frame_bgr: np.ndarray) -> str:
         return ""
     data = base64.b64encode(buf).decode("ascii")
     return f"data:image/jpeg;base64,{data}"
+
+
+def _parse_multipart(content_type: str, body: bytes) -> dict[str, tuple[str, bytes]]:
+    """Parse multipart form data without using deprecated cgi module.
+
+    Returns dict mapping field names to (filename, data) tuples.
+    For non-file fields, filename will be empty string.
+    """
+    # Build a proper email message for parsing
+    headers = f"Content-Type: {content_type}\r\n\r\n".encode("utf-8")
+    message_bytes = headers + body
+
+    parser = BytesParser()
+    msg = parser.parsebytes(message_bytes)
+
+    result = {}
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+
+            content_disp = part.get("Content-Disposition", "")
+            # Extract field name
+            name_match = re.search(r'name="([^"]*)"', content_disp)
+            if not name_match:
+                continue
+            field_name = name_match.group(1)
+
+            # Extract filename if present
+            filename = ""
+            filename_match = re.search(r'filename="([^"]*)"', content_disp)
+            if filename_match:
+                filename = filename_match.group(1)
+
+            # Get the payload
+            payload = part.get_payload(decode=True)
+            if payload is None:
+                payload = b""
+
+            result[field_name] = (filename, payload)
+
+    return result
 
 
 async def _describe_frame(image_data_url: str, prompt: str, max_tokens: int) -> str:
@@ -586,23 +628,22 @@ class VideoHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path == "/audio/upload":
-            form = cgi.FieldStorage(
-                fp=self.rfile,
-                headers=self.headers,
-                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type", "")},
-            )
+            content_length = int(self.headers.get("Content-Length", 0))
+            content_type = self.headers.get("Content-Type", "")
+            body = self.rfile.read(content_length)
+            form = _parse_multipart(content_type, body)
             if "file" not in form:
                 self._send_json({"error": "missing file"}, status=400)
                 return
-            file_item = form["file"]
-            if not file_item.filename:
+            filename, file_data = form["file"]
+            if not filename:
                 self._send_json({"error": "empty filename"}, status=400)
                 return
             os.makedirs(UPLOAD_DIR, exist_ok=True)
             video_id = uuid.uuid4().hex[:12]
             dst_path = os.path.join(UPLOAD_DIR, f"{video_id}.mp4")
             with open(dst_path, "wb") as f:
-                f.write(file_item.file.read())
+                f.write(file_data)
             print(f"[{video_id}] Starting audio-only gunshot detection")
             start_audio_stream_processing(video_id, dst_path)
             self._send_json({
@@ -613,30 +654,29 @@ class VideoHandler(BaseHTTPRequestHandler):
         if self.path != "/upload":
             self.send_error(404)
             return
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type", "")},
-        )
+        content_length = int(self.headers.get("Content-Length", 0))
+        content_type = self.headers.get("Content-Type", "")
+        body = self.rfile.read(content_length)
+        form = _parse_multipart(content_type, body)
         if "file" not in form:
             self._send_json({"error": "missing file"}, status=400)
             return
-        file_item = form["file"]
-        if not file_item.filename:
+        filename, file_data = form["file"]
+        if not filename:
             self._send_json({"error": "empty filename"}, status=400)
             return
         os.makedirs(UPLOAD_DIR, exist_ok=True)
         video_id = uuid.uuid4().hex[:12]
         dst_path = os.path.join(UPLOAD_DIR, f"{video_id}.mp4")
         with open(dst_path, "wb") as f:
-            f.write(file_item.file.read())
+            f.write(file_data)
         cap = cv2.VideoCapture(dst_path)
         duration = _video_duration(cap)
         cap.release()
         if duration <= 0:
             duration = _ffprobe_duration(dst_path)
         conn = open_video_db()
-        insert_video(conn, video_id, os.path.basename(file_item.filename), duration)
+        insert_video(conn, video_id, os.path.basename(filename), duration)
         conn.close()
 
         # Use the new stream processor if enabled
