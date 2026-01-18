@@ -117,6 +117,24 @@ class RealtimeVideoProcessor:
         if self._task:
             await self._task
 
+    async def _signal_video_complete(self):
+        """Signal the agent that video playback is complete."""
+        if not self._room:
+            return
+        # Find the agent participant
+        for p in self._room.remote_participants.values():
+            if p.identity.startswith("agent-"):
+                try:
+                    await self._room.local_participant.perform_rpc(
+                        destination_identity=p.identity,
+                        method="video_complete",
+                        payload=self.video_id,
+                    )
+                    print(f"[{self.video_id}] Signaled agent: video complete")
+                    return
+                except Exception as e:
+                    print(f"[{self.video_id}] Failed to signal agent: {e}")
+
     async def _run(self):
         env_path = os.path.join(os.path.dirname(__file__), ".env.local")
         load_dotenv(env_path)
@@ -327,7 +345,9 @@ class RealtimeVideoProcessor:
 
                     if not ok:
                         print(f"[{self.video_id}] Video complete")
-                        await asyncio.sleep(3.0)  # Allow agent to finish
+                        # Signal agent that video is done via RPC
+                        await self._signal_video_complete()
+                        await asyncio.sleep(2.0)  # Allow agent to process
                         break
 
                     # Update video offset

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 from datetime import datetime
@@ -151,12 +152,14 @@ class ConsoleTextOutput(voice_io.TextOutput):
         next_in_chain: voice_io.TextOutput | None = None,
         logger: "EventLogger | None" = None,
         start_time: float | None = None,
+        room: rtc.Room | None = None,
     ) -> None:
         super().__init__(label=label, next_in_chain=next_in_chain)
         self._buffer = ""
         self._first_seen_at: datetime | None = None
         self._logger = logger
         self._start_time = start_time  # For calculating video offset
+        self._room = room  # For publishing to frontend
         self._forbidden_re = re.compile(
             r"\b(i|i'm|im|ive|i've|id|i'd|me|my|we|we're|were|weve|we've|our|ours|us|you|your|you're|youre|you've|youve)\b",
             re.IGNORECASE,
@@ -189,8 +192,7 @@ class ConsoleTextOutput(voice_io.TextOutput):
             return stamp.strftime("%H:%M:%S")
 
     def _is_allowed(self, text: str) -> bool:
-        # Require minimum 20 chars to filter out short/meaningless responses
-        return len(text) >= 20 and text.isascii() and not self._forbidden_re.search(text) and "?" not in text
+        return text.isascii() and not self._forbidden_re.search(text) and "?" not in text
 
     async def capture_text(self, text: str) -> None:
         if not text:
@@ -212,7 +214,8 @@ class ConsoleTextOutput(voice_io.TextOutput):
                     self.next_in_chain.flush()
                 return
             text = cleaned
-            print(f"{self._red}Action [{self._get_offset()}]: {text}{self._reset}")
+            offset = self._get_offset()
+            print(f"{self._red}Action [{offset}]: {text}{self._reset}")
             if os.getenv("REALTIME_DEBUG", "0") == "1":
                 print(f"Realtime response: {text}")
             if self._logger:
@@ -222,6 +225,23 @@ class ConsoleTextOutput(voice_io.TextOutput):
                     ts=self._first_seen_at,
                     source="agent",
                 )
+            # Publish to frontend via data stream
+            if self._room and self._room.local_participant:
+                try:
+                    message = json.dumps({
+                        "type": "activity",
+                        "offset": offset,
+                        "text": text,
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    asyncio.create_task(
+                        self._room.local_participant.publish_data(
+                            message.encode("utf-8"),
+                            topic="lk.activity",
+                        )
+                    )
+                except Exception as e:
+                    print(f"Failed to publish activity: {e}")
             self._buffer = ""
             self._first_seen_at = None
         if self.next_in_chain:
@@ -286,10 +306,11 @@ async def my_agent(ctx: agents.JobContext):
         agent=agent,
         room_options=room_io.RoomOptions(
             video_input=True,
-            text_output=True,
             audio_input=is_video_room,  # Enable audio for video processing
-            text_input=False,
+            text_input=is_video_room,   # Enable text input for Q&A after video ends
+            text_output=True,
             audio_output=False,
+            close_on_disconnect=False,  # Keep session alive after video streamer leaves
         ),
     )
     session.output.transcription = ConsoleTextOutput(
@@ -297,6 +318,7 @@ async def my_agent(ctx: agents.JobContext):
         next_in_chain=session.output.transcription,
         logger=event_logger,
         start_time=session_start_time if is_video_room else None,
+        room=ctx.room,  # For publishing to frontend
     )
     loop = asyncio.get_running_loop()
     cooldown_until = 0.0
@@ -323,22 +345,43 @@ async def my_agent(ctx: agents.JobContext):
                         print(f"{yellow}[RAW EVENT] response.done (status={status}):{reset_color}")
                         print(f"{yellow}  status_details: {response.get('status_details')}{reset_color}")
 
-    # Log user transcripts (audio from video) for video rooms - only final, to database only
+    # Log user transcripts (audio from video) for video rooms and publish to frontend
     @session.on("user_input_transcribed")
     def _on_transcript(transcript):
         if not is_video_room:
             return
         if not transcript.transcript or not transcript.transcript.strip():
             return
-        # Only log final transcripts to the database (skip noisy intermediate ones)
+        text = transcript.transcript.strip()
+        ts = datetime.now()
+
+        # Log final transcripts to the database
         if transcript.is_final and event_logger:
-            text = transcript.transcript.strip()
             event_logger.log_event(
                 kind="transcript",
                 text=text,
-                ts=datetime.now(),
+                ts=ts,
                 source="audio",
             )
+
+        # Publish all transcripts to frontend (both interim and final)
+        try:
+            offset_sec = ts.timestamp() - session_start_time
+            message = json.dumps({
+                "type": "transcript",
+                "text": text,
+                "is_final": transcript.is_final,
+                "offset": f"{max(0, offset_sec):.1f}s",
+                "timestamp": ts.isoformat(),
+            })
+            asyncio.create_task(
+                ctx.room.local_participant.publish_data(
+                    message.encode("utf-8"),
+                    topic="lk.activity",
+                )
+            )
+        except Exception as e:
+            print(f"Failed to publish transcript: {e}")
 
     async def reset_chat_ctx() -> None:
         if session.llm and hasattr(session.llm, "update_chat_ctx"):
@@ -352,6 +395,8 @@ async def my_agent(ctx: agents.JobContext):
         nonlocal cooldown_until, consecutive_errors
         # Extract detailed error information - be defensive about attribute access
         print(f"{yellow}=== Agent Error Details ==={reset_color}")
+        print(f"{yellow}Raw error: {ev}{reset_color}")
+        print(f"{yellow}Error type: {type(ev)}{reset_color}")
 
         # Print all available attributes
         for attr in ['type', 'timestamp', 'recoverable', 'error', 'message']:
@@ -380,10 +425,29 @@ async def my_agent(ctx: agents.JobContext):
             asyncio.create_task(reset_chat_ctx())
 
     stop_event = asyncio.Event()
+    video_ended_event = asyncio.Event()  # Signals video processing is done
 
     @session.on("close")
     def _on_close(_):
         stop_event.set()
+
+    # Register RPC handler for video completion signal from video processor
+    @ctx.room.local_participant.register_rpc_method("video_complete")
+    async def on_video_complete(data: rtc.RpcInvocationData) -> str:
+        print(f"\n{yellow}{'='*50}{reset_color}")
+        print(f"{yellow}VIDEO PLAYBACK COMPLETE{reset_color}")
+        print(f"{yellow}Switching to text chat mode for Q&A...{reset_color}")
+        print(f"{yellow}{'='*50}{reset_color}\n")
+        video_ended_event.set()
+        return "ack"
+
+    # Fallback: detect when video streamer disconnects
+    @ctx.room.on("participant_disconnected")
+    def _on_participant_left(participant: rtc.RemoteParticipant):
+        if is_video_room and participant.identity.startswith("video-streamer-"):
+            if not video_ended_event.is_set():
+                print(f"\n{yellow}Video streamer disconnected. Switching to chat mode.{reset_color}\n")
+                video_ended_event.set()
 
     async def tail_mic_transcripts() -> None:
         # Disable transcript tailing for video rooms (too noisy) or if explicitly disabled
@@ -482,8 +546,12 @@ async def my_agent(ctx: agents.JobContext):
             if os.getenv("REALTIME_DEBUG", "0") == "1":
                 print(f"Realtime request: {instructions}")
             try:
-                # Generate reply while stream is paused
-                await session.generate_reply(instructions=instructions)
+                # Generate reply while stream is paused, disable interruptions
+                speech_handle = session.generate_reply(
+                    instructions=instructions,
+                )
+                # Wait for the response to fully complete
+                await speech_handle
                 consecutive_errors = 0  # Reset on success
             except Exception as exc:
                 consecutive_errors += 1
@@ -491,14 +559,14 @@ async def my_agent(ctx: agents.JobContext):
                     print(f"Rate limit in run_reply: {exc}")
                 raise
             finally:
-                # Always resume stream after reply (will catch up rapidly)
+                # Always resume stream after reply is complete
                 if stream_was_paused:
                     await _resume_stream()
 
             await reset_chat_ctx()
 
     async def short_loop():
-        while not stop_event.is_set():
+        while not stop_event.is_set() and not video_ended_event.is_set():
             try:
                 await run_reply(
                     instructions=(
@@ -514,7 +582,7 @@ async def my_agent(ctx: agents.JobContext):
             await asyncio.sleep(short_interval)
 
     async def long_loop():
-        while not stop_event.is_set():
+        while not stop_event.is_set() and not video_ended_event.is_set():
             try:
                 await run_reply(
                     instructions=(
@@ -531,12 +599,38 @@ async def my_agent(ctx: agents.JobContext):
                 break
             await asyncio.sleep(long_interval)
 
+    async def interactive_chat_loop():
+        """Wait for video to end, then enable interactive text chat."""
+        await video_ended_event.wait()
+
+        # Update agent instructions for Q&A mode
+        qa_instructions = (
+            "The video analysis is complete. You are now in Q&A mode. "
+            "Answer questions about what you observed in the video footage. "
+            "Be specific and reference the events, actions, statements, and interactions you witnessed. "
+            "Use third-person language ('the officer', 'the individual'). "
+            "Provide detailed, factual responses based on your observations."
+        )
+
+        if session.llm and hasattr(session.llm, 'update_options'):
+            try:
+                session.llm.update_options(instructions=qa_instructions)
+            except Exception as e:
+                print(f"Could not update instructions: {e}")
+
+        print(f"{green}Q&A mode active. Send text messages to ask about the video.{reset_color}")
+
+        # Keep session alive for text interaction - the agent will auto-respond to text input
+        await stop_event.wait()
+
     tasks = []
     tasks.append(asyncio.create_task(tail_mic_transcripts()))
-    if short_interval > 0:
-        tasks.append(asyncio.create_task(short_loop()))
-    if long_interval > 0:
-        tasks.append(asyncio.create_task(long_loop()))
+    if is_video_room:
+        if short_interval > 0:
+            tasks.append(asyncio.create_task(short_loop()))
+        if long_interval > 0:
+            tasks.append(asyncio.create_task(long_loop()))
+        tasks.append(asyncio.create_task(interactive_chat_loop()))
     await stop_event.wait()
     for task in tasks:
         task.cancel()

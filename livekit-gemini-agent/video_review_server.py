@@ -16,6 +16,10 @@ import cv2
 import numpy as np
 from dotenv import load_dotenv
 
+# Load .env.local BEFORE reading any env vars
+_env_path = os.path.join(os.path.dirname(__file__), ".env.local")
+load_dotenv(_env_path)
+
 from livekit.agents.llm import ChatContext, ImageContent
 from livekit.plugins import openai
 
@@ -35,8 +39,8 @@ USE_REALTIME_API = os.getenv("USE_REALTIME_API", "1") == "1"
 
 # Rate limiting: tokens per minute budget (leave headroom under 200k limit)
 TPM_BUDGET = int(os.getenv("VIDEO_TPM_BUDGET", "150000"))
-# Estimated tokens per image (base64 JPEG ~1024x1024)
-TOKENS_PER_IMAGE = int(os.getenv("VIDEO_TOKENS_PER_IMAGE", "1500"))
+# Estimated tokens per image (reduced due to compression - 512x512 JPEG ~500 tokens)
+TOKENS_PER_IMAGE = int(os.getenv("VIDEO_TOKENS_PER_IMAGE", "500"))
 
 
 class RateLimiter:
@@ -99,8 +103,21 @@ def _safe_text(text: str) -> str:
     return text
 
 
+# Image compression settings
+IMAGE_MAX_WIDTH = int(os.getenv("IMAGE_MAX_WIDTH", "512"))
+IMAGE_MAX_HEIGHT = int(os.getenv("IMAGE_MAX_HEIGHT", "512"))
+IMAGE_QUALITY = int(os.getenv("IMAGE_QUALITY", "60"))
+
+
 def _encode_frame_bgr(frame_bgr: np.ndarray) -> str:
-    ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    # Resize to reduce token usage (smaller = fewer tokens)
+    h, w = frame_bgr.shape[:2]
+    if w > IMAGE_MAX_WIDTH or h > IMAGE_MAX_HEIGHT:
+        scale = min(IMAGE_MAX_WIDTH / w, IMAGE_MAX_HEIGHT / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        frame_bgr = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), IMAGE_QUALITY])
     if not ok:
         return ""
     data = base64.b64encode(buf).decode("ascii")
@@ -188,6 +205,7 @@ def _extract_audio(video_path: str, wav_path: str) -> None:
 def _transcribe_audio(video_id: str, wav_path: str) -> None:
     from faster_whisper import WhisperModel
 
+    print(f"[{video_id}] Starting transcription with Whisper model: {TRANSCRIBE_MODEL}")
     conn = open_video_db()
     model = WhisperModel(TRANSCRIBE_MODEL, device="cpu", compute_type="int8")
     segments, _info = model.transcribe(
@@ -199,11 +217,14 @@ def _transcribe_audio(video_id: str, wav_path: str) -> None:
         condition_on_previous_text=False,
         vad_filter=True,
     )
+    segment_count = 0
     for seg in segments:
         text = seg.text.strip()
         if not text:
             continue
         insert_event(conn, video_id=video_id, offset_sec=seg.start, kind="transcript", text=text)
+        segment_count += 1
+    print(f"[{video_id}] Transcription complete: {segment_count} segments")
     conn.close()
 
 
@@ -301,7 +322,9 @@ def _process_actions(video_id: str, video_path: str) -> None:
                 data_url = _encode_frame_bgr(frame)
                 if data_url:
                     try:
+                        print(f"[{video_id}] Analyzing frame @ {frame_time:.1f}s with {MODEL_NAME}...")
                         text = await _describe_frame(data_url, long_prompt, max_tokens=200)
+                        print(f"[{video_id}] @ {frame_time:.1f}s: {text[:80]}...")
                         insert_event(
                             conn,
                             video_id=video_id,
@@ -371,6 +394,9 @@ def process_video(video_id: str, video_path: str) -> None:
 
     # Legacy frame-by-frame processing
     print(f"[{video_id}] Using legacy frame-by-frame processing")
+    print(f"[{video_id}] Vision model: {MODEL_NAME}")
+    print(f"[{video_id}] Transcription model: {TRANSCRIBE_MODEL}")
+    print(f"[{video_id}] Frame interval: {LONG_INTERVAL}s (short: {SHORT_INTERVAL}s)")
     conn = open_video_db()
     wav_path = f"{video_path}.wav"
     try:
@@ -519,11 +545,22 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    env_path = os.path.join(os.path.dirname(__file__), ".env.local")
-    load_dotenv(env_path)
-
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     open_video_db().close()
+
+    # Log configuration
+    print("=" * 50)
+    print("VIDEO REVIEW SERVER CONFIGURATION")
+    print("=" * 50)
+    print(f"Processing mode: {'Realtime API' if USE_REALTIME_API else 'Frame-by-frame (legacy)'}")
+    print(f"Vision model: {MODEL_NAME}")
+    print(f"Transcription model: {TRANSCRIBE_MODEL}")
+    print(f"LLM provider: {PROVIDER}")
+    print(f"Frame intervals: short={SHORT_INTERVAL}s, long={LONG_INTERVAL}s")
+    print(f"Image compression: {IMAGE_MAX_WIDTH}x{IMAGE_MAX_HEIGHT} @ quality={IMAGE_QUALITY}")
+    print(f"Est. tokens/image: {TOKENS_PER_IMAGE}")
+    print(f"Rate limit budget: {TPM_BUDGET} tokens/min")
+    print("=" * 50)
 
     server = ThreadingHTTPServer((args.host, args.port), VideoHandler)
     print(f"Video review server running at http://{args.host}:{args.port}")
