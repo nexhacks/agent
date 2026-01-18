@@ -97,6 +97,12 @@ class RealtimeVideoProcessor:
         self._stop_event = asyncio.Event()
         self._room: rtc.Room | None = None
         self._task: asyncio.Task | None = None
+        # Pause/resume state for coordinated responses
+        self._paused = False
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()  # Start unpaused
+        self._video_offset = 0.0  # Current video position in seconds
+        self._pause_start_offset = 0.0  # Video offset when paused
 
     async def start(self):
         """Start streaming the video to LiveKit."""
@@ -200,6 +206,28 @@ class RealtimeVideoProcessor:
             await self._room.connect(url, token, rtc.RoomOptions(auto_subscribe=True))
             print(f"[{self.video_id}] Connected to LiveKit room: {self.room_name}")
 
+            # Register RPC handlers for pause/resume coordination
+            @self._room.local_participant.register_rpc_method("pause_stream")
+            async def pause_stream(data: rtc.RpcInvocationData) -> str:
+                if not self._paused:
+                    self._paused = True
+                    self._pause_event.clear()
+                    self._pause_start_offset = self._video_offset
+                    print(f"[{self.video_id}] Stream PAUSED at {self._video_offset:.1f}s")
+                return f"paused at {self._video_offset:.1f}s"
+
+            @self._room.local_participant.register_rpc_method("resume_stream")
+            async def resume_stream(data: rtc.RpcInvocationData) -> str:
+                if self._paused:
+                    self._paused = False
+                    self._pause_event.set()
+                    print(f"[{self.video_id}] Stream RESUMED, catching up from {self._pause_start_offset:.1f}s")
+                return f"resumed from {self._pause_start_offset:.1f}s"
+
+            @self._room.local_participant.register_rpc_method("get_video_offset")
+            async def get_video_offset(data: rtc.RpcInvocationData) -> str:
+                return f"{self._video_offset:.2f}"
+
             # Create video source and track
             video_source = rtc.VideoSource(width, height)
             video_track = rtc.LocalVideoTrack.create_video_track("video", video_source)
@@ -284,13 +312,27 @@ class RealtimeVideoProcessor:
                 audio_task = asyncio.create_task(stream_audio())
 
             try:
+                # Catch-up speed when resuming from pause (10x normal)
+                catchup_multiplier = 10.0
+
                 while not self._stop_event.is_set():
+                    # Wait if paused
+                    if self._paused:
+                        await self._pause_event.wait()
+                        # After resume, we need to catch up
+                        # Adjust start_time to account for pause duration
+                        continue
+
                     ok, frame_bgr = await asyncio.to_thread(cap.read)
 
                     if not ok:
                         print(f"[{self.video_id}] Video complete")
                         await asyncio.sleep(3.0)  # Allow agent to finish
                         break
+
+                    # Update video offset
+                    frame_count += 1
+                    self._video_offset = frame_count / fps
 
                     # Resize if needed
                     if frame_bgr.shape[1] != width or frame_bgr.shape[0] != height:
@@ -307,11 +349,27 @@ class RealtimeVideoProcessor:
                     )
                     video_source.capture_frame(video_frame)
 
-                    frame_count += 1
+                    # Determine playback speed: normal or catch-up
+                    elapsed_real_time = asyncio.get_event_loop().time() - start_time
+                    expected_video_time = elapsed_real_time * speed_multiplier
+
+                    # If we're behind (just resumed from pause), catch up fast
+                    if self._video_offset < expected_video_time - 0.5:
+                        # Catch-up mode: minimal delay
+                        current_speed = speed_multiplier * catchup_multiplier
+                    else:
+                        # Normal mode
+                        current_speed = speed_multiplier
 
                     # Pace the playback
-                    expected_time = start_time + (frame_count * frame_interval)
+                    frame_interval_adjusted = 1.0 / (fps * current_speed)
+                    expected_time = start_time + (frame_count * (1.0 / (fps * speed_multiplier)))
                     sleep_time = expected_time - asyncio.get_event_loop().time()
+
+                    # In catch-up mode, use minimal sleep
+                    if current_speed > speed_multiplier:
+                        sleep_time = min(sleep_time, 0.001)
+
                     if sleep_time > 0:
                         await asyncio.sleep(sleep_time)
             finally:

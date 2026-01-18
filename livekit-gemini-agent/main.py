@@ -12,6 +12,7 @@ from livekit.agents import AgentServer, AgentSession, Agent, room_io, llm
 from livekit.agents.voice import io as voice_io
 from livekit.plugins import (
     openai,
+    google,
     silero,
 )
 from openai.types.beta.realtime.session import TurnDetection
@@ -59,48 +60,86 @@ class VideoEventLogger:
 ENV_PATH = os.path.join(os.path.dirname(__file__), ".env.local")
 load_dotenv(ENV_PATH)
 AGENT_NAME = os.getenv("LIVEKIT_AGENT_NAME", "assistant")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
+
+# Default instructions for video analysis
+DEFAULT_INSTRUCTIONS = (
+    "You are an objective body cam footage analyst. "
+    "Focus on describing: what people are doing and saying; "
+    "key interactions, actions, and events; any notable behavior or dialogue. "
+    "Be specific about what you observe - actions taken, words spoken, gestures made. "
+    "Use English only. Use third-person language ('the officer', 'the individual', 'the person'). "
+    "Never use first-person or second-person pronouns. "
+    "Do not describe scenery, environment, or background details unless directly relevant. "
+    "Do not address the user, ask questions, or offer help."
+)
 
 
-class VideoAssistant(Agent):
-    def __init__(self, video_processing_mode: bool = False) -> None:
-        realtime_model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
-        realtime_voice = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
-        realtime_modalities = ["text"]
+def create_realtime_model(provider: str, video_processing_mode: bool = False):
+    """Create a realtime model based on the configured provider.
 
-        # For video processing: disable automatic responses from turn detection
-        # Audio is still received for context, but responses only happen on explicit generate_reply() calls
+    Args:
+        provider: 'openai' or 'gemini'
+        video_processing_mode: If True, disable auto-response for video processing
+
+    Returns:
+        Configured RealtimeModel instance
+    """
+    if provider == "gemini":
+        # Must use a native audio model that supports Live API (bidiGenerateContent)
+        model = os.getenv("GOOGLE_REALTIME_MODEL", "gemini-live-2.5-flash-preview-native-audio-09-2025")
+        voice = os.getenv("GOOGLE_REALTIME_VOICE", "Puck")
+
+        # Build kwargs for RealtimeModel - keep it minimal for compatibility
+        kwargs = {
+            "model": model,
+            "voice": voice,
+            "instructions": DEFAULT_INSTRUCTIONS,
+        }
+
+        return google.realtime.RealtimeModel(**kwargs), model, voice, ["AUDIO"]
+
+    else:  # OpenAI (default)
+        model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
+        voice = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
+        modalities = ["text"]
+
+        # OpenAI turn detection config for video processing
         if video_processing_mode:
             turn_detection_config = TurnDetection(
                 type="server_vad",
                 threshold=0.5,
                 prefix_padding_ms=300,
                 silence_duration_ms=500,
-                create_response=False,  # Don't auto-respond to audio turns
-                interrupt_response=False,  # Don't interrupt on audio
+                create_response=False,
+                interrupt_response=False,
             )
         else:
-            turn_detection_config = None  # Use default turn detection
+            turn_detection_config = None
+
+        return openai.realtime.RealtimeModel(
+            model=model,
+            voice=voice,
+            modalities=modalities,
+            turn_detection=turn_detection_config,
+        ), model, voice, modalities
+
+
+class VideoAssistant(Agent):
+    def __init__(self, video_processing_mode: bool = False, provider: str | None = None) -> None:
+        self._provider = provider or LLM_PROVIDER
+
+        realtime_model, model_name, voice, modalities = create_realtime_model(
+            self._provider, video_processing_mode
+        )
 
         super().__init__(
-            instructions=(
-                "You are a body-cam footage analyst. "
-                "Output only detailed observations and analysis of visible actions, environment, and notable changes. "
-                "Use English only. "
-                "Use third-person language only; refer to 'the subject' or 'the scene'. "
-                "Never use first-person ('I', 'we') or second-person ('you', 'your'). "
-                "Never address the user, ask questions, greet, or offer help. "
-                "Do not mention training, prompts, or the system."
-            ),
-            llm=openai.realtime.RealtimeModel(
-                model=realtime_model,
-                voice=realtime_voice,
-                modalities=realtime_modalities,
-                turn_detection=turn_detection_config,
-            ),
+            instructions=DEFAULT_INSTRUCTIONS,
+            llm=realtime_model,
         )
-        self._realtime_model = realtime_model
-        self._realtime_voice = realtime_voice
-        self._realtime_modalities = realtime_modalities
+        self._realtime_model = model_name
+        self._realtime_voice = voice
+        self._realtime_modalities = modalities
         self._video_processing_mode = video_processing_mode
 
 
@@ -150,7 +189,8 @@ class ConsoleTextOutput(voice_io.TextOutput):
             return stamp.strftime("%H:%M:%S")
 
     def _is_allowed(self, text: str) -> bool:
-        return text.isascii() and not self._forbidden_re.search(text) and "?" not in text
+        # Require minimum 20 chars to filter out short/meaningless responses
+        return len(text) >= 20 and text.isascii() and not self._forbidden_re.search(text) and "?" not in text
 
     async def capture_text(self, text: str) -> None:
         if not text:
@@ -164,10 +204,14 @@ class ConsoleTextOutput(voice_io.TextOutput):
     def flush(self) -> None:
         if self._buffer:
             cleaned = self._normalize_text(self._buffer).strip()
-            if self._is_allowed(cleaned):
-                text = cleaned
-            else:
-                text = "No significant change."
+            if not self._is_allowed(cleaned):
+                # Skip output for disallowed text (first/second person, questions, etc.)
+                self._buffer = ""
+                self._first_seen_at = None
+                if self.next_in_chain:
+                    self.next_in_chain.flush()
+                return
+            text = cleaned
             print(f"{self._red}Action [{self._get_offset()}]: {text}{self._reset}")
             if os.getenv("REALTIME_DEBUG", "0") == "1":
                 print(f"Realtime response: {text}")
@@ -189,9 +233,15 @@ server = AgentServer(port=0)
 
 @server.rtc_session(agent_name=AGENT_NAME)
 async def my_agent(ctx: agents.JobContext):
-    print(f"Agent session started in room: {ctx.room.name} (agent={AGENT_NAME})")
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("Missing OPENAI_API_KEY. Set it in .env.local.")
+    print(f"Agent session started in room: {ctx.room.name} (agent={AGENT_NAME}, provider={LLM_PROVIDER})")
+
+    # Validate API key based on provider
+    if LLM_PROVIDER == "gemini":
+        if not os.getenv("GOOGLE_API_KEY"):
+            raise RuntimeError("Missing GOOGLE_API_KEY. Set it in .env.local.")
+    else:
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("Missing OPENAI_API_KEY. Set it in .env.local.")
 
     # Detect if this is a video processing room (room name: "video-{video_id}")
     room_name = ctx.room.name
@@ -214,12 +264,22 @@ async def my_agent(ctx: agents.JobContext):
     # For video rooms: use video_processing_mode=True to disable automatic responses
     # Audio is received for context but model only responds on explicit generate_reply() calls
     agent = VideoAssistant(video_processing_mode=is_video_room)
-    if not isinstance(agent.llm, openai.realtime.RealtimeModel):
-        raise RuntimeError("Expected OpenAI RealtimeModel; check plugin installation and config.")
-    print(
-        "OpenAI Realtime enabled "
-        f"(model={agent._realtime_model}, modalities={agent._realtime_modalities})."
-    )
+
+    # Validate model type based on provider
+    if LLM_PROVIDER == "gemini":
+        if not isinstance(agent.llm, google.realtime.RealtimeModel):
+            raise RuntimeError("Expected Google RealtimeModel; check plugin installation and config.")
+        print(
+            f"Gemini Realtime enabled "
+            f"(model={agent._realtime_model}, modalities={agent._realtime_modalities})."
+        )
+    else:
+        if not isinstance(agent.llm, openai.realtime.RealtimeModel):
+            raise RuntimeError("Expected OpenAI RealtimeModel; check plugin installation and config.")
+        print(
+            f"OpenAI Realtime enabled "
+            f"(model={agent._realtime_model}, modalities={agent._realtime_modalities})."
+        )
 
     await session.start(
         room=ctx.room,
@@ -245,22 +305,34 @@ async def my_agent(ctx: agents.JobContext):
     # Colors for console output
     green = "\033[32m"
     reset_color = "\033[0m"
+    yellow = "\033[33m"
 
-    # Log user transcripts (audio from video) for video rooms
+    # Debug: Listen to raw server events if REALTIME_DEBUG is enabled
+    if os.getenv("REALTIME_DEBUG", "0") == "1" and session.llm:
+        if LLM_PROVIDER == "openai":
+            @session.llm.on("openai_server_event_received")
+            def _on_raw_event(event):
+                event_type = event.get("type", "unknown")
+                # Only log error-related events and response.done with non-completed status
+                if event_type == "error":
+                    print(f"{yellow}[RAW EVENT] error: {event}{reset_color}")
+                elif event_type == "response.done":
+                    response = event.get("response", {})
+                    status = response.get("status")
+                    if status != "completed":
+                        print(f"{yellow}[RAW EVENT] response.done (status={status}):{reset_color}")
+                        print(f"{yellow}  status_details: {response.get('status_details')}{reset_color}")
+
+    # Log user transcripts (audio from video) for video rooms - only final, to database only
     @session.on("user_input_transcribed")
     def _on_transcript(transcript):
         if not is_video_room:
             return
         if not transcript.transcript or not transcript.transcript.strip():
             return
-        # Calculate video offset
-        offset_sec = datetime.now().timestamp() - session_start_time
-        offset_str = f"{max(0, offset_sec):.1f}s"
-        text = transcript.transcript.strip()
-        final_marker = " [FINAL]" if transcript.is_final else ""
-        print(f"{green}Transcript [{offset_str}]{final_marker}: {text}{reset_color}")
-        # Log final transcripts to the database
+        # Only log final transcripts to the database (skip noisy intermediate ones)
         if transcript.is_final and event_logger:
+            text = transcript.transcript.strip()
             event_logger.log_event(
                 kind="transcript",
                 text=text,
@@ -278,9 +350,30 @@ async def my_agent(ctx: agents.JobContext):
     @session.on("error")
     def _on_error(ev):
         nonlocal cooldown_until, consecutive_errors
-        print(f"Agent error: {ev}")
+        # Extract detailed error information - be defensive about attribute access
+        print(f"{yellow}=== Agent Error Details ==={reset_color}")
+
+        # Print all available attributes
+        for attr in ['type', 'timestamp', 'recoverable', 'error', 'message']:
+            if hasattr(ev, attr):
+                print(f"{yellow}{attr}: {getattr(ev, attr)}{reset_color}")
+
+        # If there's an inner error object, extract its details
+        inner_error = getattr(ev, 'error', None)
+        if inner_error:
+            # If the error has a body attribute (APIError), print it
+            if hasattr(inner_error, 'body') and inner_error.body:
+                body = inner_error.body
+                print(f"{yellow}Error body: {body}{reset_color}")
+                # Try to extract specific fields from the body
+                for field in ['type', 'code', 'message', 'param']:
+                    if hasattr(body, field):
+                        print(f"{yellow}  - {field}: {getattr(body, field)}{reset_color}")
+
+        print(f"{yellow}========================={reset_color}")
+
         err_str = str(ev).lower()
-        if "tokens" in err_str or "rate" in err_str or "429" in err_str:
+        if "tokens" in err_str or "rate" in err_str or "429" in err_str or "requests" in err_str:
             # Longer cooldown (30s) to let the rate limit window reset
             cooldown_until = max(cooldown_until, loop.time() + 30.0)
             consecutive_errors += 1
@@ -293,7 +386,8 @@ async def my_agent(ctx: agents.JobContext):
         stop_event.set()
 
     async def tail_mic_transcripts() -> None:
-        if os.getenv("SHOW_MIC_TRANSCRIPT", "1") != "1":
+        # Disable transcript tailing for video rooms (too noisy) or if explicitly disabled
+        if is_video_room or os.getenv("SHOW_MIC_TRANSCRIPT", "0") != "1":
             return
         conn = open_event_db()
         green = "\033[32m"
@@ -322,6 +416,46 @@ async def my_agent(ctx: agents.JobContext):
     long_interval = float(os.getenv("SCENE_LONG_INTERVAL", "20"))
     llm_lock = asyncio.Lock()
 
+    # Helper to find the video streamer participant for RPC calls
+    def _find_streamer() -> rtc.RemoteParticipant | None:
+        if not is_video_room:
+            return None
+        for p in ctx.room.remote_participants.values():
+            if p.identity.startswith("video-streamer-"):
+                return p
+        return None
+
+    async def _pause_stream() -> bool:
+        """Pause the video stream before generating a reply."""
+        streamer = _find_streamer()
+        if not streamer:
+            return False
+        try:
+            await ctx.room.local_participant.perform_rpc(
+                destination_identity=streamer.identity,
+                method="pause_stream",
+                payload="",
+            )
+            await asyncio.sleep(0.1)  # Brief pause for stream to stop
+            return True
+        except Exception as e:
+            print(f"Failed to pause stream: {e}")
+            return False
+
+    async def _resume_stream() -> None:
+        """Resume the video stream after generating a reply."""
+        streamer = _find_streamer()
+        if not streamer:
+            return
+        try:
+            await ctx.room.local_participant.perform_rpc(
+                destination_identity=streamer.identity,
+                method="resume_stream",
+                payload="",
+            )
+        except Exception as e:
+            print(f"Failed to resume stream: {e}")
+
     async def run_reply(instructions: str, max_tokens: int) -> None:
         nonlocal consecutive_errors
         async with llm_lock:
@@ -341,10 +475,14 @@ async def my_agent(ctx: agents.JobContext):
                     session.llm.update_options(max_response_output_tokens=max_tokens)
                 except Exception:
                     pass
+
+            # Pause stream before generating reply (for video rooms)
+            stream_was_paused = await _pause_stream()
+
             if os.getenv("REALTIME_DEBUG", "0") == "1":
                 print(f"Realtime request: {instructions}")
             try:
-                # Interruption handling is configured at the model level (TurnDetection)
+                # Generate reply while stream is paused
                 await session.generate_reply(instructions=instructions)
                 consecutive_errors = 0  # Reset on success
             except Exception as exc:
@@ -352,6 +490,11 @@ async def my_agent(ctx: agents.JobContext):
                 if "rate" in str(exc).lower() or "429" in str(exc):
                     print(f"Rate limit in run_reply: {exc}")
                 raise
+            finally:
+                # Always resume stream after reply (will catch up rapidly)
+                if stream_was_paused:
+                    await _resume_stream()
+
             await reset_chat_ctx()
 
     async def short_loop():
@@ -359,10 +502,9 @@ async def my_agent(ctx: agents.JobContext):
             try:
                 await run_reply(
                     instructions=(
-                        "One short English sentence (6-12 words) describing the main visible action or change. "
-                        "Third-person only; begin with 'The subject' or 'The scene'. "
-                        "Never use first-person or second-person pronouns. "
-                        "No questions, no advice, no compliments, no greetings."
+                        "One short sentence describing the most notable action or statement "
+                        "that just occurred. Be specific about what was said or done. "
+                        "If nothing notable, say: No significant activity."
                     ),
                     max_tokens=60,
                 )
@@ -376,11 +518,11 @@ async def my_agent(ctx: agents.JobContext):
             try:
                 await run_reply(
                     instructions=(
-                        "Two or three English sentences (40-70 words total) with detailed scene description, environment, and recent actions. "
-                        "Third-person only; begin each sentence with 'The subject' or 'The scene'. "
-                        "Never use first-person or second-person pronouns. "
-                        "No questions, no advice, no compliments, no greetings. "
-                        "If no clear change, say: No significant change."
+                        "Summarize the recent activity: what actions were taken? "
+                        "What was said? Who interacted with whom and how? "
+                        "Note any notable events, statements, or behaviors. "
+                        "Use third-person ('the officer approached...', 'the individual stated...'). "
+                        "If no activity occurred, say: No significant activity detected."
                     ),
                     max_tokens=220,
                 )
@@ -403,13 +545,30 @@ async def my_agent(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("Missing OPENAI_API_KEY. Set it in .env.local.")
+    # Validate API key based on provider
+    if LLM_PROVIDER == "gemini":
+        if not os.getenv("GOOGLE_API_KEY"):
+            raise RuntimeError("Missing GOOGLE_API_KEY. Set it in .env.local.")
+    else:
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("Missing OPENAI_API_KEY. Set it in .env.local.")
+
     _startup_agent = VideoAssistant()
-    if not isinstance(_startup_agent.llm, openai.realtime.RealtimeModel):
-        raise RuntimeError("Expected OpenAI RealtimeModel; check plugin installation and config.")
-    print(
-        "OpenAI Realtime configured "
-        f"(model={_startup_agent._realtime_model}, modalities={_startup_agent._realtime_modalities})."
-    )
+
+    # Validate model type and print config
+    if LLM_PROVIDER == "gemini":
+        if not isinstance(_startup_agent.llm, google.realtime.RealtimeModel):
+            raise RuntimeError("Expected Google RealtimeModel; check plugin installation and config.")
+        print(
+            f"Gemini Realtime configured "
+            f"(model={_startup_agent._realtime_model}, modalities={_startup_agent._realtime_modalities})."
+        )
+    else:
+        if not isinstance(_startup_agent.llm, openai.realtime.RealtimeModel):
+            raise RuntimeError("Expected OpenAI RealtimeModel; check plugin installation and config.")
+        print(
+            f"OpenAI Realtime configured "
+            f"(model={_startup_agent._realtime_model}, modalities={_startup_agent._realtime_modalities})."
+        )
+
     agents.cli.run_app(server)
