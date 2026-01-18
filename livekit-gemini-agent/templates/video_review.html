@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Video Review</title>
+    <title>Video Review - Realtime Analysis</title>
     <link
       href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600&display=swap"
       rel="stylesheet"
@@ -18,6 +18,7 @@
         --action: #ff5e5e;
         --transcript: #6ee7a8;
         --accent: #4aa3ff;
+        --live: #ff4444;
       }
       * {
         box-sizing: border-box;
@@ -43,6 +44,33 @@
       .status {
         color: var(--muted);
         font-size: 14px;
+        flex: 1;
+      }
+      .live-badge {
+        display: none;
+        background: var(--live);
+        color: white;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 12px;
+        font-weight: 600;
+        animation: pulse 1.5s infinite;
+      }
+      .live-badge.active {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .live-badge::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        background: white;
+        border-radius: 50%;
+      }
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.7; }
       }
       main {
         display: grid;
@@ -88,38 +116,17 @@
         opacity: 0.6;
         cursor: not-allowed;
       }
-      .events {
+      .events-header {
         display: flex;
-        flex-direction: column;
-        gap: 10px;
-        max-height: 70vh;
-        overflow-y: auto;
-      }
-      .event {
-        padding: 10px 12px;
-        border-radius: 10px;
-        border: 1px solid var(--border);
-        background: #101622;
-        font-size: 14px;
-        line-height: 1.4;
-      }
-      .event .time {
-        font-size: 12px;
-        color: var(--muted);
-        margin-bottom: 4px;
-      }
-      .event.action {
-        border-left: 3px solid var(--action);
-      }
-      .event.transcript {
-        border-left: 3px solid var(--transcript);
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
       }
       .legend {
         display: flex;
         gap: 12px;
         font-size: 13px;
         color: var(--muted);
-        margin-bottom: 10px;
       }
       .legend span {
         display: inline-flex;
@@ -137,6 +144,60 @@
       .dot.transcript {
         background: var(--transcript);
       }
+      .event-count {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .events {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        max-height: 70vh;
+        overflow-y: auto;
+      }
+      .event {
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: #101622;
+        font-size: 14px;
+        line-height: 1.4;
+        opacity: 0;
+        animation: fadeIn 0.3s ease forwards;
+      }
+      @keyframes fadeIn {
+        to { opacity: 1; }
+      }
+      .event .time {
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 4px;
+      }
+      .event.action {
+        border-left: 3px solid var(--action);
+      }
+      .event.action_realtime {
+        border-left: 3px solid var(--action);
+        background: linear-gradient(90deg, rgba(255,94,94,0.1), transparent);
+      }
+      .event.transcript {
+        border-left: 3px solid var(--transcript);
+      }
+      .event.new {
+        animation: highlight 1s ease;
+      }
+      @keyframes highlight {
+        0% { background: rgba(74, 163, 255, 0.3); }
+        100% { background: #101622; }
+      }
+      .mode-indicator {
+        font-size: 11px;
+        padding: 2px 8px;
+        border-radius: 10px;
+        background: rgba(74, 163, 255, 0.2);
+        color: var(--accent);
+        margin-left: 8px;
+      }
       @media (max-width: 900px) {
         main {
           grid-template-columns: 1fr;
@@ -147,20 +208,24 @@
   <body>
     <header>
       <h1>Video Review</h1>
-      <div class="status" id="status">Upload a video to start.</div>
+      <div class="status" id="status">Upload a video to start analysis.</div>
+      <div class="live-badge" id="live-badge">STREAMING</div>
     </header>
     <main>
       <section class="panel">
         <form id="upload-form" class="upload">
           <input type="file" id="file-input" accept="video/*" />
-          <button type="submit">Upload</button>
+          <button type="submit">Upload & Analyze</button>
         </form>
         <video id="video" controls playsinline></video>
       </section>
       <section class="panel">
-        <div class="legend">
-          <span><span class="dot action"></span>Action</span>
-          <span><span class="dot transcript"></span>Transcript</span>
+        <div class="events-header">
+          <div class="legend">
+            <span><span class="dot action"></span>Action</span>
+            <span><span class="dot transcript"></span>Transcript</span>
+          </div>
+          <div class="event-count" id="event-count"></div>
         </div>
         <div class="events" id="events"></div>
       </section>
@@ -171,12 +236,15 @@
       const statusEl = document.getElementById("status");
       const video = document.getElementById("video");
       const eventsEl = document.getElementById("events");
+      const liveBadge = document.getElementById("live-badge");
+      const eventCountEl = document.getElementById("event-count");
 
       let events = [];
-      let nextIndex = 0;
+      let displayedEventIds = new Set();
       let pollTimer = null;
       let sinceId = 0;
       let activeVideoId = null;
+      let isStreaming = false;
 
       function formatTime(sec) {
         const m = Math.floor(sec / 60);
@@ -186,25 +254,75 @@
 
       function resetEvents() {
         events = [];
-        nextIndex = 0;
+        displayedEventIds.clear();
         sinceId = 0;
         eventsEl.innerHTML = "";
+        eventCountEl.textContent = "";
       }
 
-      function renderUpTo(timeSec) {
-        while (nextIndex < events.length && events[nextIndex].offset_sec <= timeSec) {
-          const ev = events[nextIndex];
-          const el = document.createElement("div");
-          el.className = `event ${ev.kind.includes("transcript") ? "transcript" : "action"}`;
-          const time = document.createElement("div");
-          time.className = "time";
-          time.textContent = formatTime(ev.offset_sec);
-          const body = document.createElement("div");
-          body.textContent = ev.text;
-          el.append(time, body);
-          eventsEl.appendChild(el);
+      function getEventClass(kind) {
+        if (kind.includes("transcript")) return "transcript";
+        if (kind.includes("realtime")) return "action action_realtime";
+        return "action";
+      }
+
+      function renderEvent(ev, isNew = false) {
+        if (displayedEventIds.has(ev.id)) return;
+        displayedEventIds.add(ev.id);
+
+        const el = document.createElement("div");
+        el.className = `event ${getEventClass(ev.kind)}${isNew ? " new" : ""}`;
+        el.dataset.offsetSec = ev.offset_sec;
+
+        const time = document.createElement("div");
+        time.className = "time";
+        time.textContent = formatTime(ev.offset_sec);
+        if (ev.kind.includes("realtime")) {
+          const badge = document.createElement("span");
+          badge.className = "mode-indicator";
+          badge.textContent = "REALTIME";
+          time.appendChild(badge);
+        }
+
+        const body = document.createElement("div");
+        body.textContent = ev.text;
+
+        el.append(time, body);
+
+        // Insert in correct position based on offset_sec
+        let inserted = false;
+        const children = eventsEl.children;
+        for (let i = children.length - 1; i >= 0; i--) {
+          const childOffset = parseFloat(children[i].dataset.offsetSec || 0);
+          if (ev.offset_sec >= childOffset) {
+            if (i === children.length - 1) {
+              eventsEl.appendChild(el);
+            } else {
+              eventsEl.insertBefore(el, children[i + 1]);
+            }
+            inserted = true;
+            break;
+          }
+        }
+        if (!inserted) {
+          eventsEl.insertBefore(el, eventsEl.firstChild);
+        }
+
+        // Auto-scroll if near bottom
+        const isNearBottom = eventsEl.scrollHeight - eventsEl.scrollTop - eventsEl.clientHeight < 100;
+        if (isNearBottom || isNew) {
           eventsEl.scrollTop = eventsEl.scrollHeight;
-          nextIndex += 1;
+        }
+
+        eventCountEl.textContent = `${displayedEventIds.size} events`;
+      }
+
+      function renderEventsUpTo(timeSec) {
+        // Show all events up to current video time
+        for (const ev of events) {
+          if (ev.offset_sec <= timeSec + 0.5) {
+            renderEvent(ev, false);
+          }
         }
       }
 
@@ -217,8 +335,32 @@
             data.events.forEach((ev) => {
               events.push(ev);
               sinceId = Math.max(sinceId, ev.id);
+              // Render immediately if streaming (real-time mode)
+              if (isStreaming) {
+                renderEvent(ev, true);
+              }
             });
             events.sort((a, b) => a.offset_sec - b.offset_sec);
+          }
+        } catch (err) {
+          console.error(err);
+        }
+      }
+
+      async function checkStatus() {
+        if (!activeVideoId) return;
+        try {
+          const res = await fetch("/api/videos");
+          const data = await res.json();
+          const current = data.videos.find((v) => v.id === activeVideoId);
+          if (current) {
+            const status = current.status;
+            isStreaming = status === "streaming" || status === "processing";
+            liveBadge.classList.toggle("active", isStreaming);
+            statusEl.textContent = `Status: ${status}`;
+            if (status === "done") {
+              statusEl.textContent = "Analysis complete";
+            }
           }
         } catch (err) {
           console.error(err);
@@ -232,30 +374,36 @@
         const form = new FormData();
         form.append("file", file);
         statusEl.textContent = "Uploading...";
+        liveBadge.classList.remove("active");
+
         const res = await fetch("/upload", { method: "POST", body: form });
         const data = await res.json();
         activeVideoId = data.video_id;
         video.src = `/video/${activeVideoId}`;
         resetEvents();
-        statusEl.textContent = "Processing video...";
+        isStreaming = true;
+        liveBadge.classList.add("active");
+        statusEl.textContent = "Streaming to Realtime API...";
+
         if (pollTimer) clearInterval(pollTimer);
+        // Poll faster during streaming
         pollTimer = setInterval(async () => {
           await pollEvents();
-          const videosRes = await fetch("/api/videos");
-          const videosData = await videosRes.json();
-          const current = videosData.videos.find((v) => v.id === activeVideoId);
-          statusEl.textContent = current ? `Status: ${current.status}` : "Status: unknown";
-        }, 1500);
+          await checkStatus();
+        }, 500);
       });
 
       video.addEventListener("timeupdate", () => {
-        renderUpTo(video.currentTime);
+        if (!isStreaming) {
+          renderEventsUpTo(video.currentTime);
+        }
       });
 
       video.addEventListener("seeked", () => {
+        // Re-render events up to current position
         eventsEl.innerHTML = "";
-        nextIndex = 0;
-        renderUpTo(video.currentTime);
+        displayedEventIds.clear();
+        renderEventsUpTo(video.currentTime);
       });
     </script>
   </body>

@@ -6,6 +6,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from event_log import get_event_logger, open_event_db
+from video_store import open_video_db, insert_event as insert_video_event
 from livekit import agents, rtc
 from livekit.agents import AgentServer, AgentSession, Agent, room_io, llm
 from livekit.agents.voice import io as voice_io
@@ -13,6 +14,47 @@ from livekit.plugins import (
     openai,
     silero,
 )
+from openai.types.beta.realtime.session import TurnDetection
+
+
+class VideoEventLogger:
+    """Logger that writes events to the video database with offset timing."""
+
+    def __init__(self, video_id: str, start_time: float):
+        self._video_id = video_id
+        self._start_time = start_time
+        self._conn = open_video_db()
+
+    def log_event(
+        self,
+        *,
+        kind: str,
+        text: str,
+        ts: datetime | float | str | None = None,
+        source: str | None = None,
+    ) -> None:
+        if not text:
+            return
+        # Calculate offset from session start
+        if isinstance(ts, datetime):
+            offset = ts.timestamp() - self._start_time
+        elif isinstance(ts, (int, float)):
+            offset = ts - self._start_time
+        else:
+            offset = datetime.now().timestamp() - self._start_time
+
+        offset = max(0.0, offset)  # Ensure non-negative
+
+        insert_video_event(
+            self._conn,
+            video_id=self._video_id,
+            offset_sec=offset,
+            kind=kind,
+            text=text,
+        )
+
+    def close(self) -> None:
+        self._conn.close()
 
 ENV_PATH = os.path.join(os.path.dirname(__file__), ".env.local")
 load_dotenv(ENV_PATH)
@@ -20,7 +62,25 @@ AGENT_NAME = os.getenv("LIVEKIT_AGENT_NAME", "assistant")
 
 
 class VideoAssistant(Agent):
-    def __init__(self) -> None:
+    def __init__(self, video_processing_mode: bool = False) -> None:
+        realtime_model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
+        realtime_voice = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
+        realtime_modalities = ["text"]
+
+        # For video processing: disable automatic responses from turn detection
+        # Audio is still received for context, but responses only happen on explicit generate_reply() calls
+        if video_processing_mode:
+            turn_detection_config = TurnDetection(
+                type="server_vad",
+                threshold=0.5,
+                prefix_padding_ms=300,
+                silence_duration_ms=500,
+                create_response=False,  # Don't auto-respond to audio turns
+                interrupt_response=False,  # Don't interrupt on audio
+            )
+        else:
+            turn_detection_config = None  # Use default turn detection
+
         super().__init__(
             instructions=(
                 "You are a body-cam footage analyst. "
@@ -32,11 +92,16 @@ class VideoAssistant(Agent):
                 "Do not mention training, prompts, or the system."
             ),
             llm=openai.realtime.RealtimeModel(
-                model=os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime"),
-                voice=os.getenv("OPENAI_REALTIME_VOICE", "alloy"),
-                modalities=["text"],
+                model=realtime_model,
+                voice=realtime_voice,
+                modalities=realtime_modalities,
+                turn_detection=turn_detection_config,
             ),
         )
+        self._realtime_model = realtime_model
+        self._realtime_voice = realtime_voice
+        self._realtime_modalities = realtime_modalities
+        self._video_processing_mode = video_processing_mode
 
 
 class ConsoleTextOutput(voice_io.TextOutput):
@@ -46,11 +111,13 @@ class ConsoleTextOutput(voice_io.TextOutput):
         label: str,
         next_in_chain: voice_io.TextOutput | None = None,
         logger: "EventLogger | None" = None,
+        start_time: float | None = None,
     ) -> None:
         super().__init__(label=label, next_in_chain=next_in_chain)
         self._buffer = ""
         self._first_seen_at: datetime | None = None
         self._logger = logger
+        self._start_time = start_time  # For calculating video offset
         self._forbidden_re = re.compile(
             r"\b(i|i'm|im|ive|i've|id|i'd|me|my|we|we're|were|weve|we've|our|ours|us|you|your|you're|youre|you've|youve)\b",
             re.IGNORECASE,
@@ -72,9 +139,15 @@ class ConsoleTextOutput(voice_io.TextOutput):
             text = text.replace(src, dst)
         return text
 
-    def _timestamp(self) -> str:
-        stamp = self._first_seen_at or datetime.now()
-        return stamp.strftime("%H:%M:%S")
+    def _get_offset(self) -> str:
+        """Return video offset in seconds, or wall-clock time if no start_time."""
+        if self._start_time is not None:
+            stamp = self._first_seen_at or datetime.now()
+            offset_sec = stamp.timestamp() - self._start_time
+            return f"{max(0, offset_sec):.1f}s"
+        else:
+            stamp = self._first_seen_at or datetime.now()
+            return stamp.strftime("%H:%M:%S")
 
     def _is_allowed(self, text: str) -> bool:
         return text.isascii() and not self._forbidden_re.search(text) and "?" not in text
@@ -95,7 +168,9 @@ class ConsoleTextOutput(voice_io.TextOutput):
                 text = cleaned
             else:
                 text = "No significant change."
-            print(f"{self._red}Action [{self._timestamp()}]: {text}{self._reset}")
+            print(f"{self._red}Action [{self._get_offset()}]: {text}{self._reset}")
+            if os.getenv("REALTIME_DEBUG", "0") == "1":
+                print(f"Realtime response: {text}")
             if self._logger:
                 self._logger.log_event(
                     kind="action",
@@ -115,18 +190,44 @@ server = AgentServer(port=0)
 @server.rtc_session(agent_name=AGENT_NAME)
 async def my_agent(ctx: agents.JobContext):
     print(f"Agent session started in room: {ctx.room.name} (agent={AGENT_NAME})")
-    session = AgentSession(vad=silero.VAD.load())
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("Missing OPENAI_API_KEY. Set it in .env.local.")
-    event_logger = get_event_logger()
+
+    # Detect if this is a video processing room (room name: "video-{video_id}")
+    room_name = ctx.room.name
+    video_id = None
+    session_start_time = datetime.now().timestamp()
+
+    # For video processing rooms, enable audio input so the model can hear the video's audio
+    is_video_room = room_name.startswith("video-")
+
+    # Session uses VAD for all cases; turn detection is configured at the model level
+    session = AgentSession(vad=silero.VAD.load())
+
+    if is_video_room:
+        video_id = room_name[6:]  # Extract video_id from "video-{video_id}"
+        event_logger = VideoEventLogger(video_id, session_start_time)
+        print(f"Video processing mode: video_id={video_id} (audio+video input, no auto-response)")
+    else:
+        event_logger = get_event_logger()
+
+    # For video rooms: use video_processing_mode=True to disable automatic responses
+    # Audio is received for context but model only responds on explicit generate_reply() calls
+    agent = VideoAssistant(video_processing_mode=is_video_room)
+    if not isinstance(agent.llm, openai.realtime.RealtimeModel):
+        raise RuntimeError("Expected OpenAI RealtimeModel; check plugin installation and config.")
+    print(
+        "OpenAI Realtime enabled "
+        f"(model={agent._realtime_model}, modalities={agent._realtime_modalities})."
+    )
 
     await session.start(
         room=ctx.room,
-        agent=VideoAssistant(),
+        agent=agent,
         room_options=room_io.RoomOptions(
             video_input=True,
             text_output=True,
-            audio_input=False,
+            audio_input=is_video_room,  # Enable audio for video processing
             text_input=False,
             audio_output=False,
         ),
@@ -135,9 +236,37 @@ async def my_agent(ctx: agents.JobContext):
         label="console",
         next_in_chain=session.output.transcription,
         logger=event_logger,
+        start_time=session_start_time if is_video_room else None,
     )
     loop = asyncio.get_running_loop()
     cooldown_until = 0.0
+    consecutive_errors = 0
+
+    # Colors for console output
+    green = "\033[32m"
+    reset_color = "\033[0m"
+
+    # Log user transcripts (audio from video) for video rooms
+    @session.on("user_input_transcribed")
+    def _on_transcript(transcript):
+        if not is_video_room:
+            return
+        if not transcript.transcript or not transcript.transcript.strip():
+            return
+        # Calculate video offset
+        offset_sec = datetime.now().timestamp() - session_start_time
+        offset_str = f"{max(0, offset_sec):.1f}s"
+        text = transcript.transcript.strip()
+        final_marker = " [FINAL]" if transcript.is_final else ""
+        print(f"{green}Transcript [{offset_str}]{final_marker}: {text}{reset_color}")
+        # Log final transcripts to the database
+        if transcript.is_final and event_logger:
+            event_logger.log_event(
+                kind="transcript",
+                text=text,
+                ts=datetime.now(),
+                source="audio",
+            )
 
     async def reset_chat_ctx() -> None:
         if session.llm and hasattr(session.llm, "update_chat_ctx"):
@@ -148,10 +277,13 @@ async def my_agent(ctx: agents.JobContext):
 
     @session.on("error")
     def _on_error(ev):
-        nonlocal cooldown_until
+        nonlocal cooldown_until, consecutive_errors
         print(f"Agent error: {ev}")
-        if "tokens" in str(ev).lower():
-            cooldown_until = max(cooldown_until, loop.time() + 5.0)
+        err_str = str(ev).lower()
+        if "tokens" in err_str or "rate" in err_str or "429" in err_str:
+            # Longer cooldown (30s) to let the rate limit window reset
+            cooldown_until = max(cooldown_until, loop.time() + 30.0)
+            consecutive_errors += 1
             asyncio.create_task(reset_chat_ctx())
 
     stop_event = asyncio.Event()
@@ -185,20 +317,41 @@ async def my_agent(ctx: agents.JobContext):
         finally:
             conn.close()
 
-    short_interval = float(os.getenv("SCENE_SHORT_INTERVAL", "3"))
-    long_interval = float(os.getenv("SCENE_LONG_INTERVAL", "7"))
+    # Longer intervals to avoid rate limits (realtime API has its own limits)
+    short_interval = float(os.getenv("SCENE_SHORT_INTERVAL", "8"))
+    long_interval = float(os.getenv("SCENE_LONG_INTERVAL", "20"))
     llm_lock = asyncio.Lock()
 
     async def run_reply(instructions: str, max_tokens: int) -> None:
+        nonlocal consecutive_errors
         async with llm_lock:
+            # Apply adaptive backoff based on consecutive errors
+            if consecutive_errors > 0:
+                backoff = min(2.0 ** consecutive_errors, 60.0)
+                print(f"Adaptive backoff: waiting {backoff:.1f}s due to {consecutive_errors} recent errors")
+                await asyncio.sleep(backoff)
+
             if loop.time() < cooldown_until:
-                await asyncio.sleep(cooldown_until - loop.time())
+                wait_time = cooldown_until - loop.time()
+                print(f"Cooldown active: waiting {wait_time:.1f}s")
+                await asyncio.sleep(wait_time)
+
             if session.llm and hasattr(session.llm, "update_options"):
                 try:
                     session.llm.update_options(max_response_output_tokens=max_tokens)
                 except Exception:
                     pass
-            await session.generate_reply(instructions=instructions)
+            if os.getenv("REALTIME_DEBUG", "0") == "1":
+                print(f"Realtime request: {instructions}")
+            try:
+                # Interruption handling is configured at the model level (TurnDetection)
+                await session.generate_reply(instructions=instructions)
+                consecutive_errors = 0  # Reset on success
+            except Exception as exc:
+                consecutive_errors += 1
+                if "rate" in str(exc).lower() or "429" in str(exc):
+                    print(f"Rate limit in run_reply: {exc}")
+                raise
             await reset_chat_ctx()
 
     async def short_loop():
@@ -250,4 +403,13 @@ async def my_agent(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Missing OPENAI_API_KEY. Set it in .env.local.")
+    _startup_agent = VideoAssistant()
+    if not isinstance(_startup_agent.llm, openai.realtime.RealtimeModel):
+        raise RuntimeError("Expected OpenAI RealtimeModel; check plugin installation and config.")
+    print(
+        "OpenAI Realtime configured "
+        f"(model={_startup_agent._realtime_model}, modalities={_startup_agent._realtime_modalities})."
+    )
     agents.cli.run_app(server)

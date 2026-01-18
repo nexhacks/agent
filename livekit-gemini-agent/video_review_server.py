@@ -23,12 +23,59 @@ from video_store import insert_event, insert_video, list_events, list_videos, op
 
 
 UPLOAD_DIR = os.getenv("VIDEO_UPLOAD_DIR", "uploads")
-SHORT_INTERVAL = float(os.getenv("VIDEO_SHORT_INTERVAL", "3"))
-LONG_INTERVAL = float(os.getenv("VIDEO_LONG_INTERVAL", "7"))
+SHORT_INTERVAL = float(os.getenv("VIDEO_SHORT_INTERVAL", "10"))
+LONG_INTERVAL = float(os.getenv("VIDEO_LONG_INTERVAL", "25"))
 MODEL_NAME = os.getenv("VIDEO_ACTION_MODEL", "gpt-4o-mini")
 PROCESS_REALTIME = os.getenv("VIDEO_PROCESS_REALTIME", "1") == "1"
 TRANSCRIBE_MODEL = os.getenv("VIDEO_TRANSCRIBE_MODEL", "tiny")
 PROVIDER = os.getenv("VIDEO_LLM_PROVIDER", "openai").lower()
+
+# Use the OpenAI Realtime API instead of frame-by-frame processing
+USE_REALTIME_API = os.getenv("USE_REALTIME_API", "1") == "1"
+
+# Rate limiting: tokens per minute budget (leave headroom under 200k limit)
+TPM_BUDGET = int(os.getenv("VIDEO_TPM_BUDGET", "150000"))
+# Estimated tokens per image (base64 JPEG ~1024x1024)
+TOKENS_PER_IMAGE = int(os.getenv("VIDEO_TOKENS_PER_IMAGE", "1500"))
+
+
+class RateLimiter:
+    """Simple token bucket rate limiter for OpenAI TPM limits."""
+
+    def __init__(self, tokens_per_minute: int):
+        self._tpm = tokens_per_minute
+        self._tokens_used = 0
+        self._window_start = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, tokens: int) -> None:
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            # Reset window every minute
+            if now - self._window_start >= 60.0:
+                self._tokens_used = 0
+                self._window_start = now
+
+            # If we'd exceed budget, wait until window resets
+            if self._tokens_used + tokens > self._tpm:
+                wait_time = 60.0 - (now - self._window_start) + 1.0
+                print(f"Rate limit: waiting {wait_time:.1f}s before next API call")
+                await asyncio.sleep(wait_time)
+                self._tokens_used = 0
+                self._window_start = asyncio.get_running_loop().time()
+
+            self._tokens_used += tokens
+
+
+# Global rate limiter instance
+_rate_limiter: RateLimiter | None = None
+
+
+def _get_rate_limiter() -> RateLimiter:
+    global _rate_limiter
+    if _rate_limiter is None:
+        _rate_limiter = RateLimiter(TPM_BUDGET)
+    return _rate_limiter
 
 
 SYSTEM_PROMPT = (
@@ -61,6 +108,11 @@ def _encode_frame_bgr(frame_bgr: np.ndarray) -> str:
 
 
 async def _describe_frame(image_data_url: str, prompt: str, max_tokens: int) -> str:
+    # Proactive rate limiting - acquire tokens before making the call
+    # Estimate: image tokens + prompt tokens + max output tokens
+    estimated_tokens = TOKENS_PER_IMAGE + 200 + max_tokens
+    await _get_rate_limiter().acquire(estimated_tokens)
+
     chat_ctx = ChatContext()
     chat_ctx.add_message(role="system", content=[SYSTEM_PROMPT])
     chat_ctx.add_message(role="user", content=[ImageContent(image=image_data_url), prompt])
@@ -68,16 +120,49 @@ async def _describe_frame(image_data_url: str, prompt: str, max_tokens: int) -> 
         raise RuntimeError(
             "Gemini provider not installed. Install the LiveKit Google plugin to use it."
         )
-    llm = openai.LLM(model=MODEL_NAME, temperature=0.2)
-    stream = llm.chat(
-        chat_ctx=chat_ctx,
-        extra_kwargs={"max_completion_tokens": max_tokens},
-    )
-    text = ""
-    async for piece in stream.to_str_iterable():
-        text += piece
-    await llm.aclose()
-    return _safe_text(text)
+
+    def _rate_limit_delay(message: str, attempt: int) -> float:
+        match = re.search(r"try again in (\d+)\s*ms", message, re.IGNORECASE)
+        if match:
+            return max(float(match.group(1)) / 1000.0, 0.5)
+        # Exponential backoff with longer waits
+        return min(2.0 ** (attempt + 1), 30.0)
+
+    def _is_rate_limit(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "rate limit" in message or "429" in message
+
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        llm = None
+        try:
+            llm = openai.LLM(model=MODEL_NAME, temperature=0.2)
+            stream = llm.chat(
+                chat_ctx=chat_ctx,
+                extra_kwargs={"max_completion_tokens": max_tokens},
+            )
+            text = ""
+            async for piece in stream.to_str_iterable():
+                text += piece
+            await llm.aclose()
+            return _safe_text(text)
+        except Exception as exc:
+            last_exc = exc
+            if llm is not None:
+                try:
+                    await llm.aclose()
+                except Exception:
+                    pass
+            if _is_rate_limit(exc) and attempt < 4:
+                delay = _rate_limit_delay(str(exc), attempt)
+                print(f"Rate limit hit, waiting {delay:.1f}s (attempt {attempt + 1}/5)")
+                await asyncio.sleep(delay)
+                continue
+            raise
+
+    if last_exc:
+        raise last_exc
+    return "No significant change."
 
 
 def _extract_audio(video_path: str, wav_path: str) -> None:
@@ -86,10 +171,15 @@ def _extract_audio(video_path: str, wav_path: str) -> None:
         "-y",
         "-i",
         video_path,
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
         "-ac",
         "1",
         "-ar",
         "16000",
+        "-af",
+        "aresample=async=1:first_pts=0",
         wav_path,
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -125,14 +215,33 @@ def _video_duration(cap: cv2.VideoCapture) -> float:
     return total / fps
 
 
+def _ffprobe_duration(video_path: str) -> float:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
 def _process_actions(video_id: str, video_path: str) -> None:
     conn = open_video_db()
     cap = cv2.VideoCapture(video_path)
-    duration = _video_duration(cap)
-    if duration <= 0:
-        cap.release()
-        conn.close()
-        return
 
     async def _run() -> None:
         short_prompt = (
@@ -148,36 +257,120 @@ def _process_actions(video_id: str, video_path: str) -> None:
             "No questions, no advice, no compliments, no greetings. "
             "If no clear change, say: No significant change."
         )
-
-        schedule: list[tuple[float, str, str, int]] = []
-        for t in np.arange(0, duration, SHORT_INTERVAL):
-            schedule.append((float(t), "action_short", short_prompt, 80))
-        for t in np.arange(0, duration, LONG_INTERVAL):
-            schedule.append((float(t), "action_long", long_prompt, 200))
-        schedule.sort(key=lambda item: item[0])
-
+        short_next = 0.0 if SHORT_INTERVAL > 0 else None
+        long_next = 0.0 if LONG_INTERVAL > 0 else None
         start_wall = asyncio.get_running_loop().time()
-        for t, kind, prompt, max_tokens in schedule:
-            if PROCESS_REALTIME:
-                wait = start_wall + t - asyncio.get_running_loop().time()
-                if wait > 0:
-                    await asyncio.sleep(wait)
-            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        if fps <= 0:
+            fps = 30.0
+        frame_index = 0
+        epsilon = 0.001
+
+        while True:
             ok, frame = cap.read()
             if not ok:
-                continue
-            data_url = _encode_frame_bgr(frame)
-            if not data_url:
-                continue
-            text = await _describe_frame(data_url, prompt, max_tokens=max_tokens)
-            insert_event(conn, video_id=video_id, offset_sec=t, kind=kind, text=text)
+                break
+            frame_index += 1
+            frame_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if frame_time <= 0:
+                frame_time = frame_index / fps
+            if PROCESS_REALTIME:
+                wait = start_wall + frame_time - asyncio.get_running_loop().time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+
+            if short_next is not None and frame_time + epsilon >= short_next:
+                data_url = _encode_frame_bgr(frame)
+                if data_url:
+                    try:
+                        text = await _describe_frame(data_url, short_prompt, max_tokens=80)
+                        insert_event(
+                            conn,
+                            video_id=video_id,
+                            offset_sec=frame_time,
+                            kind="action_short",
+                            text=text,
+                        )
+                    except Exception as exc:
+                        print(f"Action short failed at {frame_time:.2f}s: {exc}")
+                short_next += SHORT_INTERVAL
+                while short_next is not None and short_next <= frame_time:
+                    short_next += SHORT_INTERVAL
+
+            if long_next is not None and frame_time + epsilon >= long_next:
+                data_url = _encode_frame_bgr(frame)
+                if data_url:
+                    try:
+                        text = await _describe_frame(data_url, long_prompt, max_tokens=200)
+                        insert_event(
+                            conn,
+                            video_id=video_id,
+                            offset_sec=frame_time,
+                            kind="action_long",
+                            text=text,
+                        )
+                    except Exception as exc:
+                        print(f"Action long failed at {frame_time:.2f}s: {exc}")
+                long_next += LONG_INTERVAL
+                while long_next is not None and long_next <= frame_time:
+                    long_next += LONG_INTERVAL
 
     asyncio.run(_run())
     cap.release()
     conn.close()
 
 
+def _process_video_realtime(video_id: str, video_path: str) -> None:
+    """Process video using the OpenAI Realtime API via LiveKit streaming."""
+    from realtime_video_processor import RealtimeVideoProcessor
+
+    async def _run():
+        processor = RealtimeVideoProcessor(video_id, video_path)
+        await processor.start()
+        await processor.wait()
+
+    asyncio.run(_run())
+
+
+def _process_video_legacy(video_id: str, video_path: str) -> None:
+    """Process video using frame-by-frame gpt-4o-mini API calls."""
+    conn = open_video_db()
+    wav_path = f"{video_path}.wav"
+    try:
+        _extract_audio(video_path, wav_path)
+        threads = [
+            threading.Thread(target=_transcribe_audio, args=(video_id, wav_path), daemon=True),
+            threading.Thread(target=_process_actions, args=(video_id, video_path), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        update_video_status(conn, video_id, "done")
+    except Exception as exc:
+        print(f"Legacy processing error: {exc}")
+        update_video_status(conn, video_id, "error")
+    finally:
+        conn.close()
+        try:
+            if os.path.exists(wav_path):
+                os.remove(wav_path)
+        except Exception:
+            pass
+
+
 def process_video(video_id: str, video_path: str) -> None:
+    """Process video - uses Realtime API by default, falls back to legacy."""
+    if USE_REALTIME_API:
+        print(f"[{video_id}] Using Realtime API processing")
+        try:
+            _process_video_realtime(video_id, video_path)
+            return
+        except Exception as exc:
+            print(f"[{video_id}] Realtime API failed, falling back to legacy: {exc}")
+
+    # Legacy frame-by-frame processing
+    print(f"[{video_id}] Using legacy frame-by-frame processing")
     conn = open_video_db()
     wav_path = f"{video_path}.wav"
     try:
@@ -228,17 +421,33 @@ class VideoHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(length))
                 self.send_header("Accept-Ranges", "bytes")
                 self.end_headers()
-                with open(path, "rb") as f:
-                    f.seek(start)
-                    self.wfile.write(f.read(length))
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(start)
+                        remaining = length
+                        while remaining > 0:
+                            chunk = f.read(min(1024 * 512, remaining))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            remaining -= len(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
                 return
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(file_size))
         self.send_header("Accept-Ranges", "bytes")
         self.end_headers()
-        with open(path, "rb") as f:
-            self.wfile.write(f.read())
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 512)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -294,6 +503,8 @@ class VideoHandler(BaseHTTPRequestHandler):
         cap = cv2.VideoCapture(dst_path)
         duration = _video_duration(cap)
         cap.release()
+        if duration <= 0:
+            duration = _ffprobe_duration(dst_path)
         conn = open_video_db()
         insert_video(conn, video_id, os.path.basename(file_item.filename), duration)
         conn.close()
