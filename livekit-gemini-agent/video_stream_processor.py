@@ -36,26 +36,61 @@ MODEL_NAME = os.getenv("VIDEO_ACTION_MODEL", "gpt-4o-mini")
 AUDIO_SAMPLE_RATE = 16000
 
 # System prompt for video analysis - event-focused, not frame-descriptive
-SYSTEM_PROMPT = """You are a body cam footage event logger. Your job is to identify and log specific EVENTS, ACTIONS, and STATEMENTS as they occur.
+SYSTEM_PROMPT = """You are a body cam footage event logger. Your job is to describe what is happening in each moment.
 
-CRITICAL - ALWAYS CALL OUT:
-- **WEAPON DRAWN**: If anyone draws, pulls, or brandishes a gun, firearm, knife, or weapon - IMMEDIATELY log "WEAPON: [description]"
-- **WEAPON VISIBLE**: If a weapon is visible on anyone's person or in their hands
-- **AGGRESSIVE ACTIONS**: Lunging, striking, charging, fighting
+!!! HIGHEST PRIORITY - ALERTS !!!
+If you see ANY of these, START your response with the alert in ALL CAPS:
+
+WEAPONS:
+- GUN DRAWN: "⚠️ GUN DRAWN! Officer/Subject draws firearm..."
+- TASER DRAWN: "⚠️ TASER DRAWN! Officer deploys taser..."
+- TASER FIRED: "⚠️ TASER FIRED! Taser discharged at subject..."
+- SHOTS FIRED: "⚠️ SHOTS FIRED! Gunfire detected..."
+- KNIFE/WEAPON: "⚠️ WEAPON! Subject brandishes knife/weapon..."
+- GUN VISIBLE: "⚠️ GUN VISIBLE! Firearm seen on subject's person..."
+- GUN POINTED: "⚠️ GUN POINTED! Weapon aimed at..."
+
+CAMERA STATUS:
+- CAMERA BLOCKED: "⚠️ CAMERA BLOCKED! View obstructed by hand/object/darkness..."
+- CAMERA OBSCURED: "⚠️ CAMERA OBSCURED! Partial obstruction, limited visibility..."
+
+PERSON DOWN:
+- PERSON ON FLOOR: "⚠️ PERSON ON FLOOR! Individual lying on ground/floor..."
+- PERSON DOWN: "⚠️ PERSON DOWN! Subject fallen/taken down..."
+- PERSON PRONE: "⚠️ PERSON PRONE! Individual face-down on ground..."
+
+ALSO CALL OUT:
+- AGGRESSIVE ACTIONS: Lunging, striking, charging, fighting, resisting
+- PHYSICAL ALTERCATION: Any physical contact between officer and subject
 
 RULES:
-- Log concrete events: someone speaks, moves, gestures, enters/exits, physical actions
-- NEVER start with "In this frame" or "The frame shows" - just state what happened
-- Use active voice: "Officer approaches vehicle" not "The officer is approaching"
-- Be concise: 1-2 short sentences max
-- Describe what you see, even if similar to before
+- ALWAYS describe what people are doing: standing, walking, talking, gesturing, looking around
+- Log positions: "Officer stands by driver door", "Subject seated in vehicle"
+- Log interactions: conversations, handoffs, pointing, approaching, backing away
+- NEVER start with "In this frame" - just state what's happening
+- Use active voice: "Officer speaks with driver" not "The officer is speaking"
+- Be concise: 1-2 sentences
 - Use third person: 'the officer', 'the subject', 'the individual'
 
-GOOD: "Officer exits vehicle. Subject raises hands."
-GOOD: "WEAPON: Officer draws service pistol."
-BAD: "In this frame, the officer is shown exiting their vehicle."
+GOOD: "⚠️ TASER DRAWN! Officer draws taser, subject backs away with hands up."
+GOOD: "⚠️ GUN DRAWN! Officer unholsters service weapon, takes cover position."
+GOOD: "Officer stands at driver window speaking with occupant."
+BAD: "No new activity" (always describe what you see, even if routine)
 
-You are logging events for later review, not writing prose descriptions."""
+You are logging a continuous record of events - describe what's visible even during calm moments."""
+
+# Separate prompt for scene descriptions - used at start and periodically
+SCENE_PROMPT = """Describe the scene and people in plain text, no markdown or bullet points.
+
+Include: Location type, then each person with their role, clothing colors/types, build, hair, and position.
+
+Example format:
+"Interior residence, stairway with yellow walls. Officer in dark blue uniform and tactical vest, medium build, hair in bun, standing on stairs. Male subject in light blue shirt and dark pants, slim build, short hair, at top of stairs facing officer."
+
+Write as a single flowing paragraph. Be specific about clothing colors for identification."""
+
+# How often to do full scene descriptions (in seconds)
+SCENE_DESCRIPTION_INTERVAL = 30.0
 
 
 @dataclass
@@ -185,9 +220,8 @@ class VideoStreamProcessor:
             prompt_parts.append(f"Speech detected: \"{audio_context}\"")
 
         prompt_parts.append(
-            "Log any NEW events since the previous log. "
-            "What actions occurred? Who spoke? What changed? "
-            "If nothing changed, respond: No new activity"
+            "Describe what is happening. What are people doing? Any movement, gestures, or interaction? "
+            "If truly nothing has changed from the previous log (same positions, no movement), say: No new activity"
         )
 
         prompt = "\n\n".join(prompt_parts)
@@ -211,6 +245,29 @@ class VideoStreamProcessor:
             return response.choices[0].message.content.strip()
         except Exception as e:
             print(f"[{self.video_id}] Frame analysis error: {e}")
+            return ""
+
+    def _analyze_scene(self, image_url: str) -> str:
+        """Analyze a frame for scene and person descriptions."""
+        try:
+            response = self._client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "You are a scene and person description specialist for body cam footage review."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_url, "detail": "low"}},
+                            {"type": "text", "text": SCENE_PROMPT},
+                        ],
+                    },
+                ],
+                max_tokens=300,
+                temperature=0.3,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"[{self.video_id}] Scene analysis error: {e}")
             return ""
 
     async def _transcribe_with_deepgram(self, wav_path: str) -> None:
@@ -382,6 +439,7 @@ class VideoStreamProcessor:
             first_frame_analyzed = False
             last_activity_time = 0.0  # Track when we last had real activity
             no_activity_start = None  # Track start of "no activity" period
+            last_scene_time = -999.0  # Track when we last did a scene description
 
             self._emit(0, "status", "Analyzing video frames...")
 
@@ -395,8 +453,10 @@ class VideoStreamProcessor:
 
                 # Analyze the FIRST frame immediately (at ~0.5s) to capture opening scene
                 should_analyze = False
+                is_first_frame = False
                 if not first_frame_analyzed and frame_count >= int(fps * 0.5):
                     should_analyze = True
+                    is_first_frame = True
                     first_frame_analyzed = True
                 elif frame_count % frame_interval_frames == 0:
                     should_analyze = True
@@ -408,6 +468,16 @@ class VideoStreamProcessor:
                 image_url = self._encode_frame(frame)
                 if not image_url:
                     continue
+
+                # Check if we should do a scene description (first frame or periodic)
+                should_describe_scene = is_first_frame or (current_time - last_scene_time >= SCENE_DESCRIPTION_INTERVAL)
+
+                if should_describe_scene:
+                    scene_desc = self._analyze_scene(image_url)
+                    if scene_desc:
+                        self._emit(current_time, "scene", scene_desc)
+                        print(f"[{self.video_id}] SCENE @ {current_time:.1f}s: {scene_desc[:80]}...")
+                        last_scene_time = current_time
 
                 # Get audio context for this time window (from live transcripts)
                 audio_context = self._get_transcripts_in_window(current_time)
@@ -477,19 +547,28 @@ class VideoStreamProcessor:
             self._stop_event.set()
 
     def _is_no_activity_response(self, text: str) -> bool:
-        """Check if response indicates no new activity."""
+        """Check if response indicates no new activity - balanced matching."""
         text_lower = text.lower().strip()
-        no_activity_phrases = [
+
+        # Too short to be meaningful
+        if len(text_lower) < 15:
+            return True
+
+        # Check if the response STARTS with a no-activity phrase
+        # This catches "No new activity." but not "Officer stands still, no new activity since last update."
+        no_activity_starts = [
             "no new activity",
-            "no significant",
+            "no activity",
+            "no change",
             "nothing new",
-            "no changes",
-            "no notable",
             "scene unchanged",
-            "continues as before",
-            "same as previous",
+            "no movement",
         ]
-        return any(phrase in text_lower for phrase in no_activity_phrases)
+        for phrase in no_activity_starts:
+            if text_lower.startswith(phrase):
+                return True
+
+        return False
 
     def _emit_no_activity_range(self, start_time: float, end_time: float) -> None:
         """Emit a no-activity event showing the time range."""

@@ -17,8 +17,10 @@
         --muted: #9aa3b2;
         --action: #ff5e5e;
         --transcript: #6ee7a8;
+        --scene: #c792ea;
         --accent: #4aa3ff;
         --live: #ff4444;
+        --alert: #ff0000;
       }
       * {
         box-sizing: border-box;
@@ -144,6 +146,9 @@
       .dot.transcript {
         background: var(--transcript);
       }
+      .dot.scene {
+        background: var(--scene);
+      }
       .event-count {
         font-size: 12px;
         color: var(--muted);
@@ -190,6 +195,10 @@
       .event.transcript {
         border-left: 3px solid var(--transcript);
       }
+      .event.scene {
+        border-left: 3px solid var(--scene);
+        background: linear-gradient(90deg, rgba(199,146,234,0.1), transparent);
+      }
       .event.no_activity {
         border-left: 3px solid var(--border);
         opacity: 0.6;
@@ -198,6 +207,16 @@
       }
       .event.no_activity .time {
         display: none;
+      }
+      .event.alert {
+        border-left: 4px solid var(--alert);
+        background: linear-gradient(90deg, rgba(255,0,0,0.25), rgba(255,0,0,0.05));
+        font-weight: 600;
+        animation: alertPulse 1s ease-in-out 3;
+      }
+      @keyframes alertPulse {
+        0%, 100% { background: linear-gradient(90deg, rgba(255,0,0,0.25), rgba(255,0,0,0.05)); }
+        50% { background: linear-gradient(90deg, rgba(255,0,0,0.4), rgba(255,0,0,0.15)); }
       }
       .mode-indicator {
         font-size: 11px;
@@ -231,6 +250,8 @@
       <section class="panel">
         <div class="events-header">
           <div class="legend">
+            <span><span class="dot" style="background:var(--alert)"></span>Alert</span>
+            <span><span class="dot scene"></span>Scene</span>
             <span><span class="dot action"></span>Action</span>
             <span><span class="dot transcript"></span>Transcript</span>
           </div>
@@ -254,6 +275,7 @@
       let sinceId = 0;
       let activeVideoId = null;
       let isStreaming = false;
+      let lastRenderedTime = -1;
 
       function formatTime(sec) {
         const m = Math.floor(sec / 60);
@@ -265,24 +287,40 @@
         events = [];
         displayedEventIds.clear();
         sinceId = 0;
+        lastRenderedTime = -1;
         eventsEl.innerHTML = "";
         eventCountEl.textContent = "";
       }
 
-      function getEventClass(kind) {
+      function getEventClass(kind, text = "") {
+        // Check for alerts first (highest priority)
+        const alertKeywords = [
+          "⚠️",
+          // Weapons
+          "GUN DRAWN", "TASER DRAWN", "TASER FIRED", "SHOTS FIRED", "WEAPON!", "GUN VISIBLE", "GUN POINTED",
+          // Camera
+          "CAMERA BLOCKED", "CAMERA OBSCURED",
+          // Person down
+          "PERSON ON FLOOR", "PERSON DOWN", "PERSON PRONE"
+        ];
+        const upperText = text.toUpperCase();
+        for (const keyword of alertKeywords) {
+          if (text.includes(keyword) || upperText.includes(keyword)) {
+            return "alert";
+          }
+        }
         if (kind.includes("transcript")) return "transcript";
+        if (kind.includes("scene")) return "scene";
         if (kind.includes("realtime")) return "action action_realtime";
         if (kind.includes("no_activity")) return "no_activity";
         return "action";
       }
 
       function renderEvent(ev, isNew = false) {
-        if (displayedEventIds.has(ev.id)) return;
-        displayedEventIds.add(ev.id);
-
         const el = document.createElement("div");
-        el.className = `event ${getEventClass(ev.kind)}${isNew ? " new" : ""}`;
+        el.className = `event ${getEventClass(ev.kind, ev.text)}${isNew ? " new" : ""}`;
         el.dataset.offsetSec = ev.offset_sec;
+        el.dataset.eventId = ev.id;
 
         const time = document.createElement("div");
         time.className = "time";
@@ -323,17 +361,42 @@
         if (isNearBottom || isNew) {
           eventsEl.scrollTop = eventsEl.scrollHeight;
         }
-
-        eventCountEl.textContent = `${displayedEventIds.size} events`;
       }
 
-      function renderEventsUpTo(timeSec) {
-        // Show all events up to current video time
+      function syncEventsToTime(timeSec, forceRebuild = false) {
+        // If rewinding or force rebuild, clear and rebuild
+        if (forceRebuild || timeSec < lastRenderedTime - 1) {
+          eventsEl.innerHTML = "";
+          displayedEventIds.clear();
+        }
+
+        // Show events up to current time
+        let visibleCount = 0;
         for (const ev of events) {
           if (ev.offset_sec <= timeSec + 0.5) {
-            renderEvent(ev, false);
+            if (!displayedEventIds.has(ev.id)) {
+              displayedEventIds.add(ev.id);
+              // Show "new" animation only for events appearing at current playback edge
+              const isNewEvent = ev.offset_sec > lastRenderedTime && ev.offset_sec <= timeSec + 0.5;
+              renderEvent(ev, isNewEvent);
+            }
+            visibleCount++;
           }
         }
+
+        // Remove events that are ahead of current time (after rewind)
+        const children = Array.from(eventsEl.children);
+        for (const child of children) {
+          const offset = parseFloat(child.dataset.offsetSec || 0);
+          if (offset > timeSec + 0.5) {
+            const id = parseInt(child.dataset.eventId);
+            displayedEventIds.delete(id);
+            child.remove();
+          }
+        }
+
+        lastRenderedTime = timeSec;
+        eventCountEl.textContent = `${displayedEventIds.size} / ${events.length} events`;
       }
 
       async function pollEvents() {
@@ -343,14 +406,15 @@
           const data = await res.json();
           if (data.events && data.events.length) {
             data.events.forEach((ev) => {
-              events.push(ev);
-              sinceId = Math.max(sinceId, ev.id);
-              // Render immediately if streaming (real-time mode)
-              if (isStreaming) {
-                renderEvent(ev, true);
+              // Avoid duplicates
+              if (!events.find(e => e.id === ev.id)) {
+                events.push(ev);
               }
+              sinceId = Math.max(sinceId, ev.id);
             });
             events.sort((a, b) => a.offset_sec - b.offset_sec);
+            // Sync to current video time
+            syncEventsToTime(video.currentTime);
           }
         } catch (err) {
           console.error(err);
@@ -404,16 +468,13 @@
       });
 
       video.addEventListener("timeupdate", () => {
-        if (!isStreaming) {
-          renderEventsUpTo(video.currentTime);
-        }
+        // Always sync events to video time (both during streaming and playback)
+        syncEventsToTime(video.currentTime);
       });
 
       video.addEventListener("seeked", () => {
-        // Re-render events up to current position
-        eventsEl.innerHTML = "";
-        displayedEventIds.clear();
-        renderEventsUpTo(video.currentTime);
+        // Force rebuild when seeking to handle both forward and backward jumps
+        syncEventsToTime(video.currentTime, true);
       });
     </script>
   </body>
