@@ -163,9 +163,6 @@ class VideoStreamProcessor:
         self._event_queue: queue.Queue[VideoEvent | None] = queue.Queue()
         self._stop_event = threading.Event()
         self._processing_thread: threading.Thread | None = None
-        # Thread-safe transcript storage for real-time updates
-        self._transcripts: list[tuple[float, str]] = []
-        self._transcripts_lock = threading.Lock()
 
     def start(self) -> None:
         """Start processing in a background thread."""
@@ -219,19 +216,6 @@ class VideoStreamProcessor:
         except Exception as e:
             print(f"[{self.video_id}] Failed to save event: {e}")
 
-    def _add_transcript(self, offset: float, text: str) -> None:
-        """Add a transcript to the thread-safe list."""
-        with self._transcripts_lock:
-            self._transcripts.append((offset, text))
-
-    def _get_transcripts_in_window(self, current_time: float, window: float = 5.0) -> str:
-        """Get transcripts within a time window of the current frame."""
-        with self._transcripts_lock:
-            relevant = []
-            for t, text in self._transcripts:
-                if current_time - window <= t <= current_time + 1.0:
-                    relevant.append(text)
-            return " ".join(relevant) if relevant else ""
 
     def _encode_frame(self, frame_bgr: np.ndarray) -> str:
         """Encode frame to base64 data URL."""
@@ -247,15 +231,12 @@ class VideoStreamProcessor:
         data = base64.b64encode(buf).decode("ascii")
         return f"data:image/jpeg;base64,{data}"
 
-    def _analyze_frame_with_audio(self, image_url: str, audio_context: str, visual_context: str = "") -> str:
-        """Analyze a frame with audio transcript context."""
+    def _analyze_frame_with_audio(self, image_url: str, visual_context: str = "") -> str:
+        """Analyze a frame with optional prior visual context."""
         prompt_parts = []
 
         if visual_context:
             prompt_parts.append(f"Previous event logged: {visual_context}")
-
-        if audio_context:
-            prompt_parts.append(f"Speech detected: \"{audio_context}\"")
 
         prompt_parts.append(
             "Describe what is happening. What are people doing? Any movement, gestures, or interaction? "
@@ -307,103 +288,6 @@ class VideoStreamProcessor:
         except Exception as e:
             print(f"[{self.video_id}] Scene analysis error: {e}")
             return ""
-
-    async def _transcribe_with_deepgram(self, wav_path: str) -> None:
-        """Stream audio to Deepgram for segmented transcription."""
-        import asyncio
-        try:
-            import websockets
-        except ImportError:
-            print(f"[{self.video_id}] websockets not installed")
-            return
-
-        deepgram_key = os.getenv("DEEPGRAM_API_KEY", "")
-        if not deepgram_key:
-            print(f"[{self.video_id}] No DEEPGRAM_API_KEY, skipping transcription")
-            return
-
-        # Deepgram URL - use nova-2 with utterances for better segmentation
-        url = (
-            f"wss://api.deepgram.com/v1/listen?"
-            f"model=nova-2&"
-            f"punctuate=true&"
-            f"utterances=true&"
-            f"utt_split=0.8&"
-            f"encoding=linear16&"
-            f"sample_rate={AUDIO_SAMPLE_RATE}&"
-            f"channels=1&"
-            f"language=en"
-        )
-
-        headers = {"Authorization": f"Token {deepgram_key}"}
-
-        print(f"[{self.video_id}] Connecting to Deepgram...")
-
-        try:
-            async with websockets.connect(url, additional_headers=headers) as ws:
-                print(f"[{self.video_id}] Connected to Deepgram")
-
-                async def send_audio():
-                    """Send audio chunks to Deepgram."""
-                    chunk_size = int(AUDIO_SAMPLE_RATE * 0.5) * 2  # 500ms chunks
-
-                    with open(wav_path, "rb") as f:
-                        f.seek(44)  # Skip WAV header
-                        chunk_count = 0
-                        while not self._stop_event.is_set():
-                            chunk = f.read(chunk_size)
-                            if not chunk:
-                                break
-                            await ws.send(chunk)
-                            chunk_count += 1
-                            await asyncio.sleep(0.02)  # Fast streaming
-
-                    await ws.send(json.dumps({"type": "CloseStream"}))
-                    print(f"[{self.video_id}] Sent {chunk_count} audio chunks")
-
-                async def receive_transcripts():
-                    """Receive and emit transcripts."""
-                    count = 0
-                    try:
-                        async for message in ws:
-                            if self._stop_event.is_set():
-                                break
-
-                            data = json.loads(message)
-
-                            if data.get("type") == "Results":
-                                channel = data.get("channel", {})
-                                alternatives = channel.get("alternatives", [])
-
-                                if alternatives:
-                                    transcript = alternatives[0].get("transcript", "").strip()
-                                    if transcript:
-                                        count += 1
-                                        start = data.get("start", 0)
-
-                                        # Get speaker if available
-                                        words = alternatives[0].get("words", [])
-                                        if words and "speaker" in words[0]:
-                                            speaker = words[0]["speaker"]
-                                            text = f"Speaker {speaker + 1}: {transcript}"
-                                        else:
-                                            text = transcript
-
-                                        print(f"[{self.video_id}] TRANSCRIPT #{count} @ {start:.1f}s: {text[:50]}...")
-                                        self._add_transcript(start, text)
-                                        self._emit(start, "transcript", text)
-
-                    except websockets.exceptions.ConnectionClosed:
-                        pass
-
-                    print(f"[{self.video_id}] Deepgram: {count} transcripts received")
-
-                await asyncio.gather(send_audio(), receive_transcripts())
-
-        except Exception as e:
-            print(f"[{self.video_id}] Deepgram error: {e}")
-            import traceback
-            traceback.print_exc()
 
     def _extract_audio(self) -> str | None:
         """Extract audio from video to a WAV file."""
@@ -748,29 +632,6 @@ class VideoStreamProcessor:
             self._emit(0, "status", "Extracting audio...")
             wav_path = self._extract_audio()
 
-            # Transcribe audio using Deepgram for segmented transcripts
-            transcribe_thread = None
-            if wav_path:
-                print(f"[{self.video_id}] Starting Deepgram transcription...")
-                self._emit(0, "status", "Transcribing audio with Deepgram...")
-
-                # Run async Deepgram transcription in a thread with its own event loop
-                def run_deepgram_transcription():
-                    import asyncio
-                    try:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        loop.run_until_complete(self._transcribe_with_deepgram(wav_path))
-                        loop.close()
-                    except Exception as e:
-                        print(f"[{self.video_id}] Deepgram thread error: {e}")
-                        import traceback
-                        traceback.print_exc()
-
-                transcribe_thread = threading.Thread(target=run_deepgram_transcription, daemon=True)
-                transcribe_thread.start()
-                print(f"[{self.video_id}] Deepgram transcription thread started")
-
             # Start gunshot detection in parallel
             gunshot_thread = None
             if wav_path:
@@ -832,10 +693,7 @@ class VideoStreamProcessor:
                             print(f"[{self.video_id}] SCENE @ {current_time:.1f}s: {scene_desc[:80]}...")
                             last_scene_time = current_time
 
-                # Get audio context for this time window (from live transcripts)
-                audio_context = self._get_transcripts_in_window(current_time)
-
-                description = self._analyze_frame_with_audio(image_url, audio_context, last_context)
+                description = self._analyze_frame_with_audio(image_url, last_context)
 
                 if description:
                     # Check if it's a "no activity" response
@@ -886,11 +744,6 @@ class VideoStreamProcessor:
                 self._emit_no_activity_range(no_activity_start, duration)
 
             cap.release()
-
-            # Wait for Deepgram transcription to finish
-            if transcribe_thread and transcribe_thread.is_alive():
-                print(f"[{self.video_id}] Waiting for Deepgram transcription to complete...")
-                transcribe_thread.join(timeout=60.0)  # 60 second timeout for transcription
 
             # Wait for gunshot detection to finish
             if gunshot_thread and gunshot_thread.is_alive():
@@ -992,5 +845,70 @@ def get_stream_processor(video_id: str) -> VideoStreamProcessor | None:
 def stop_stream_processing(video_id: str) -> None:
     """Stop processing a video."""
     processor = _active_processors.pop(video_id, None)
+    if processor:
+        processor.stop()
+
+
+class AudioStreamProcessor(VideoStreamProcessor):
+    """Audio-only processor that emits gunshot/taser alerts via SSE."""
+
+    def start(self) -> None:
+        self._processing_thread = threading.Thread(
+            target=self._process_audio_only,
+            daemon=True,
+        )
+        self._processing_thread.start()
+
+    def _emit(self, offset: float, kind: str, text: str) -> None:
+        event = VideoEvent(
+            offset_sec=offset,
+            kind=kind,
+            text=text,
+            timestamp=datetime.now().isoformat(),
+        )
+        self._event_queue.put(event)
+
+    def _process_audio_only(self) -> None:
+        wav_path = None
+        try:
+            self._emit(0, "status", "Extracting audio for gunshot detection...")
+            wav_path = self._extract_audio()
+            if not wav_path:
+                self._emit(0, "status", "Error: Audio extraction failed")
+                return
+            self._emit(0, "status", "Running gunshot detection...")
+            self._detect_gunshots(wav_path)
+            self._emit(0, "status", "Gunshot detection complete")
+        except Exception as exc:
+            self._emit(0, "status", f"Error: {exc}")
+        finally:
+            if wav_path and os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except Exception:
+                    pass
+            self._event_queue.put(None)
+            self._stop_event.set()
+
+
+_active_audio_processors: dict[str, AudioStreamProcessor] = {}
+
+
+def start_audio_stream_processing(video_id: str, video_path: str) -> AudioStreamProcessor:
+    """Start audio-only gunshot detection and return the processor for SSE streaming."""
+    processor = AudioStreamProcessor(video_id, video_path)
+    _active_audio_processors[video_id] = processor
+    processor.start()
+    return processor
+
+
+def get_audio_stream_processor(video_id: str) -> AudioStreamProcessor | None:
+    """Get an active audio-only processor."""
+    return _active_audio_processors.get(video_id)
+
+
+def stop_audio_stream_processing(video_id: str) -> None:
+    """Stop audio-only processing."""
+    processor = _active_audio_processors.pop(video_id, None)
     if processor:
         processor.stop()

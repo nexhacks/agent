@@ -24,6 +24,7 @@ from livekit.agents.llm import ChatContext, ImageContent
 from livekit.plugins import openai
 
 from video_store import insert_event, insert_video, list_events, list_videos, open_video_db, update_video_status
+from video_stream_processor import get_audio_stream_processor, start_audio_stream_processing
 
 
 UPLOAD_DIR = os.getenv("VIDEO_UPLOAD_DIR", "uploads")
@@ -31,7 +32,6 @@ SHORT_INTERVAL = float(os.getenv("VIDEO_SHORT_INTERVAL", "10"))
 LONG_INTERVAL = float(os.getenv("VIDEO_LONG_INTERVAL", "25"))
 MODEL_NAME = os.getenv("VIDEO_ACTION_MODEL", "gpt-4o-mini")
 PROCESS_REALTIME = os.getenv("VIDEO_PROCESS_REALTIME", "1") == "1"
-TRANSCRIBE_MODEL = os.getenv("VIDEO_TRANSCRIBE_MODEL", "tiny")
 PROVIDER = os.getenv("VIDEO_LLM_PROVIDER", "openai").lower()
 
 # Use the OpenAI Realtime API instead of frame-by-frame processing
@@ -205,30 +205,6 @@ def _extract_audio(video_path: str, wav_path: str) -> None:
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _transcribe_audio(video_id: str, wav_path: str) -> None:
-    from faster_whisper import WhisperModel
-
-    print(f"[{video_id}] Starting transcription with Whisper model: {TRANSCRIBE_MODEL}")
-    conn = open_video_db()
-    model = WhisperModel(TRANSCRIBE_MODEL, device="cpu", compute_type="int8")
-    segments, _info = model.transcribe(
-        wav_path,
-        language="en",
-        beam_size=1,
-        best_of=1,
-        temperature=0.0,
-        condition_on_previous_text=False,
-        vad_filter=True,
-    )
-    segment_count = 0
-    for seg in segments:
-        text = seg.text.strip()
-        if not text:
-            continue
-        insert_event(conn, video_id=video_id, offset_sec=seg.start, kind="transcript", text=text)
-        segment_count += 1
-    print(f"[{video_id}] Transcription complete: {segment_count} segments")
-    conn.close()
 
 
 def _video_duration(cap: cv2.VideoCapture) -> float:
@@ -391,7 +367,6 @@ def _process_video_legacy(video_id: str, video_path: str) -> None:
     try:
         _extract_audio(video_path, wav_path)
         threads = [
-            threading.Thread(target=_transcribe_audio, args=(video_id, wav_path), daemon=True),
             threading.Thread(target=_process_actions, args=(video_id, video_path), daemon=True),
         ]
         for thread in threads:
@@ -424,14 +399,12 @@ def process_video(video_id: str, video_path: str) -> None:
     # Legacy frame-by-frame processing
     print(f"[{video_id}] Using legacy frame-by-frame processing")
     print(f"[{video_id}] Vision model: {MODEL_NAME}")
-    print(f"[{video_id}] Transcription model: {TRANSCRIBE_MODEL}")
     print(f"[{video_id}] Frame interval: {LONG_INTERVAL}s (short: {SHORT_INTERVAL}s)")
     conn = open_video_db()
     wav_path = f"{video_path}.wav"
     try:
         _extract_audio(video_path, wav_path)
         threads = [
-            threading.Thread(target=_transcribe_audio, args=(video_id, wav_path), daemon=True),
             threading.Thread(target=_process_actions, args=(video_id, video_path), daemon=True),
         ]
         for thread in threads:
@@ -547,6 +520,30 @@ class VideoHandler(BaseHTTPRequestHandler):
         except Exception as e:
             print(f"[{video_id}] SSE stream error: {e}")
 
+    def _stream_audio_sse(self, video_id: str) -> None:
+        """Stream Server-Sent Events for audio-only gunshot detection."""
+        processor = get_audio_stream_processor(video_id)
+        if not processor:
+            self.send_error(404, "No active audio stream for this video")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self._send_cors_headers()
+        self.end_headers()
+
+        try:
+            for event in processor.events():
+                sse_data = event.to_sse()
+                self.wfile.write(sse_data.encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            print(f"[{video_id}] Audio SSE client disconnected")
+        except Exception as e:
+            print(f"[{video_id}] Audio SSE stream error: {e}")
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
@@ -572,6 +569,11 @@ class VideoHandler(BaseHTTPRequestHandler):
             video_id = parsed.path.split("/api/stream/")[1]
             self._stream_sse(video_id)
             return
+        # Audio-only SSE streaming endpoint
+        if parsed.path.startswith("/api/audio/stream/"):
+            video_id = parsed.path.split("/api/audio/stream/")[1]
+            self._stream_audio_sse(video_id)
+            return
         if parsed.path.startswith("/video/"):
             video_id = parsed.path.split("/video/")[1]
             path = os.path.join(UPLOAD_DIR, f"{video_id}.mp4")
@@ -583,6 +585,31 @@ class VideoHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self) -> None:
+        if self.path == "/audio/upload":
+            form = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers.get("Content-Type", "")},
+            )
+            if "file" not in form:
+                self._send_json({"error": "missing file"}, status=400)
+                return
+            file_item = form["file"]
+            if not file_item.filename:
+                self._send_json({"error": "empty filename"}, status=400)
+                return
+            os.makedirs(UPLOAD_DIR, exist_ok=True)
+            video_id = uuid.uuid4().hex[:12]
+            dst_path = os.path.join(UPLOAD_DIR, f"{video_id}.mp4")
+            with open(dst_path, "wb") as f:
+                f.write(file_item.file.read())
+            print(f"[{video_id}] Starting audio-only gunshot detection")
+            start_audio_stream_processing(video_id, dst_path)
+            self._send_json({
+                "video_id": video_id,
+                "stream_url": f"/api/audio/stream/{video_id}",
+            })
+            return
         if self.path != "/upload":
             self.send_error(404)
             return
@@ -653,7 +680,6 @@ def main() -> None:
     else:
         print(f"Processing mode: Frame-by-frame (legacy)")
     print(f"Vision model: {MODEL_NAME}")
-    print(f"Transcription model: {TRANSCRIBE_MODEL}")
     print("=" * 50)
 
     server = ThreadingHTTPServer((args.host, args.port), VideoHandler)
