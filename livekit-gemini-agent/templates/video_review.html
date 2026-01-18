@@ -21,6 +21,7 @@
         --accent: #4aa3ff;
         --live: #ff4444;
         --alert: #ff0000;
+        --warning: #f59e0b;
       }
       * {
         box-sizing: border-box;
@@ -210,13 +211,21 @@
       }
       .event.alert {
         border-left: 4px solid var(--alert);
-        background: linear-gradient(90deg, rgba(255,0,0,0.25), rgba(255,0,0,0.05));
+        background: linear-gradient(90deg, rgba(255,0,0,0.2), rgba(255,0,0,0.02));
         font-weight: 600;
-        animation: alertPulse 1s ease-in-out 3;
+        animation: alertPulse 0.8s ease-in-out 2;
       }
       @keyframes alertPulse {
-        0%, 100% { background: linear-gradient(90deg, rgba(255,0,0,0.25), rgba(255,0,0,0.05)); }
-        50% { background: linear-gradient(90deg, rgba(255,0,0,0.4), rgba(255,0,0,0.15)); }
+        0%, 100% { background: linear-gradient(90deg, rgba(255,0,0,0.2), rgba(255,0,0,0.02)); }
+        50% { background: linear-gradient(90deg, rgba(255,0,0,0.35), rgba(255,0,0,0.1)); }
+      }
+      .event.warning {
+        border-left: 3px solid var(--warning);
+        background: linear-gradient(90deg, rgba(245,158,11,0.12), transparent);
+      }
+      .event.audio {
+        border-left: 3px solid #60a5fa;
+        background: linear-gradient(90deg, rgba(96,165,250,0.1), transparent);
       }
       .mode-indicator {
         font-size: 11px;
@@ -250,8 +259,9 @@
       <section class="panel">
         <div class="events-header">
           <div class="legend">
-            <span><span class="dot" style="background:var(--alert)"></span>Alert</span>
-            <span><span class="dot scene"></span>Scene</span>
+            <span><span class="dot" style="background:var(--alert)"></span>Critical</span>
+            <span><span class="dot" style="background:var(--warning)"></span>Warning</span>
+            <span><span class="dot" style="background:#60a5fa"></span>Audio</span>
             <span><span class="dot action"></span>Action</span>
             <span><span class="dot transcript"></span>Transcript</span>
           </div>
@@ -293,22 +303,37 @@
       }
 
       function getEventClass(kind, text = "") {
-        // Check for alerts first (highest priority)
-        const alertKeywords = [
-          "⚠️",
-          // Weapons
-          "GUN DRAWN", "TASER DRAWN", "TASER FIRED", "SHOTS FIRED", "WEAPON!", "GUN VISIBLE", "GUN POINTED",
-          // Camera
-          "CAMERA BLOCKED", "CAMERA OBSCURED",
-          // Person down
-          "PERSON ON FLOOR", "PERSON DOWN", "PERSON PRONE"
-        ];
         const upperText = text.toUpperCase();
-        for (const keyword of alertKeywords) {
-          if (text.includes(keyword) || upperText.includes(keyword)) {
+
+        // CRITICAL (red) - Immediate danger or critical issues
+        const criticalKeywords = [
+          "SHOTS FIRED",
+          "PERSON ON FLOOR", "PERSON DOWN", "PERSON PRONE",
+          "CAMERA BLOCKED"
+        ];
+        for (const keyword of criticalKeywords) {
+          if (upperText.includes(keyword)) {
             return "alert";
           }
         }
+
+        // AUDIO detections (blue) - ML audio detection events
+        if (upperText.includes("AUDIO:")) {
+          return "audio";
+        }
+
+        // WARNING (orange) - Weapons present, potential danger
+        const warningKeywords = [
+          "GUN DRAWN", "GUN VISIBLE", "GUN POINTED",
+          "TASER DRAWN", "TASER FIRED",
+          "WEAPON!", "CAMERA OBSCURED"
+        ];
+        for (const keyword of warningKeywords) {
+          if (upperText.includes(keyword)) {
+            return "warning";
+          }
+        }
+
         if (kind.includes("transcript")) return "transcript";
         if (kind.includes("scene")) return "scene";
         if (kind.includes("realtime")) return "action action_realtime";

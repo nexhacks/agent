@@ -35,6 +35,43 @@ MODEL_NAME = os.getenv("VIDEO_ACTION_MODEL", "gpt-4o-mini")
 # Audio settings for extraction
 AUDIO_SAMPLE_RATE = 16000
 
+# Gunshot/impulsive sound detection settings (fallback if YAMNet unavailable)
+GUNSHOT_CHUNK_MS = 100  # Analyze in 100ms windows
+GUNSHOT_AMPLITUDE_THRESHOLD = 0.80  # Raised to filter false positives (0.71-0.74) while catching real shots (0.86-0.93)
+GUNSHOT_FREQ_MIN = 2500  # Hz - raised to filter out false positives at 2490Hz
+GUNSHOT_FREQ_MAX = 2600  # Hz - real gunshots observed at 2515-2558 Hz
+TASER_FREQ_THRESHOLD = 3500  # Hz - tasers have high frequency (observed: 3919Hz)
+GUNSHOT_COOLDOWN = 0.3  # Seconds between alerts (gunshots can be rapid)
+
+# Impulsiveness detection - gunshots have very fast attack, yelling builds slowly
+ATTACK_TIME_THRESHOLD_MS = 10  # Gunshots reach peak within 10ms (yelling takes 50-100ms+)
+SOUND_DURATION_MAX_MS = 150  # Gunshots are very short (<150ms), yelling is sustained
+CREST_FACTOR_THRESHOLD = 3.0  # Peak-to-RMS ratio (gunshots ~4-6, yelling ~2-3)
+
+# YAMNet ML-based detection settings
+YAMNET_CONFIDENCE_THRESHOLD = 0.15  # Lowered to catch more potential gunshots
+YAMNET_WINDOW_SEC = 0.96  # YAMNet expects ~1 second windows
+USE_YAMNET = True  # Enable YAMNet ML detection (falls back to heuristics if unavailable)
+YAMNET_DEBUG = True  # Print top predictions for debugging
+
+# YAMNet class indices for relevant sounds (from AudioSet ontology)
+# See: https://storage.googleapis.com/audioset/yamnet/yamnet_class_map.csv
+YAMNET_GUNSHOT_CLASSES = {
+    # Gunfire related
+    427: "Gunshot, gunfire",
+    428: "Machine gun",
+    429: "Fusillade",
+    430: "Artillery fire",
+    # Explosion related
+    426: "Explosion",
+    494: "Bang",  # Generic bang sound
+    # Cap gun / toy gun (sometimes detected)
+    431: "Cap gun",
+}
+
+# Minimum activity update interval - force emit even during quiet periods
+MIN_ACTIVITY_INTERVAL = 10.0  # At least one activity update every 10 seconds
+
 # System prompt for video analysis - event-focused, not frame-descriptive
 SYSTEM_PROMPT = """You are a body cam footage event logger. Your job is to describe what is happening in each moment.
 
@@ -89,8 +126,9 @@ Example format:
 
 Write as a single flowing paragraph. Be specific about clothing colors for identification."""
 
-# How often to do full scene descriptions (in seconds)
-SCENE_DESCRIPTION_INTERVAL = 30.0
+# Scene description settings
+ENABLE_SCENE_DESCRIPTIONS = os.getenv("ENABLE_SCENE_DESCRIPTIONS", "1") == "1"
+SCENE_DESCRIPTION_INTERVAL = 30.0  # How often to do full scene descriptions (in seconds)
 
 
 @dataclass
@@ -383,6 +421,306 @@ class VideoStreamProcessor:
             print(f"[{self.video_id}] Audio extraction failed: {e}")
             return None
 
+    def _load_yamnet(self):
+        """Load YAMNet model (cached after first load)."""
+        if not hasattr(self, '_yamnet_model'):
+            try:
+                print(f"[{self.video_id}] Importing tensorflow_hub...")
+                import tensorflow_hub as hub
+                print(f"[{self.video_id}] Loading YAMNet model from TensorFlow Hub...")
+                print(f"[{self.video_id}] (This may take a minute on first run as the model downloads)")
+                self._yamnet_model = hub.load('https://tfhub.dev/google/yamnet/1')
+                print(f"[{self.video_id}] YAMNet model loaded successfully!")
+            except ImportError as e:
+                print(f"[{self.video_id}] tensorflow_hub not installed: {e}")
+                print(f"[{self.video_id}] Run: pip install tensorflow tensorflow-hub")
+                self._yamnet_model = None
+            except Exception as e:
+                print(f"[{self.video_id}] Failed to load YAMNet: {e}")
+                import traceback
+                traceback.print_exc()
+                self._yamnet_model = None
+        return self._yamnet_model
+
+    def _detect_gunshots(self, wav_path: str) -> None:
+        """Analyze audio for gunshots using YAMNet ML model with heuristic fallback."""
+        import wave
+
+        print(f"[{self.video_id}] Starting gunshot detection on: {wav_path}")
+
+        try:
+            with wave.open(wav_path, "rb") as wf:
+                sample_rate = wf.getframerate()
+                n_channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
+                n_frames = wf.getnframes()
+                duration = n_frames / sample_rate
+                raw_data = wf.readframes(n_frames)
+
+            print(f"[{self.video_id}] Audio: {duration:.1f}s, {sample_rate}Hz, {n_channels}ch, {sample_width*8}bit")
+
+            # Convert to numpy array
+            if sample_width == 2:
+                audio = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sample_width == 1:
+                audio = np.frombuffer(raw_data, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+            else:
+                print(f"[{self.video_id}] Unsupported audio format: {sample_width} bytes")
+                return
+
+            # Convert stereo to mono
+            if n_channels == 2:
+                audio = audio.reshape(-1, 2).mean(axis=1)
+
+            # Audio stats
+            peak = np.max(np.abs(audio))
+            rms = np.sqrt(np.mean(audio**2))
+            print(f"[{self.video_id}] Audio stats: peak={peak:.3f}, rms={rms:.3f}, samples={len(audio)}")
+
+            # Try YAMNet first
+            if USE_YAMNET:
+                print(f"[{self.video_id}] Attempting YAMNet ML detection...")
+                yamnet_model = self._load_yamnet()
+                if yamnet_model is not None:
+                    self._detect_gunshots_yamnet(audio, sample_rate, yamnet_model)
+                    return
+                else:
+                    print(f"[{self.video_id}] YAMNet model failed to load, falling back to heuristics")
+
+            # Fallback to heuristic detection
+            print(f"[{self.video_id}] Using heuristic gunshot detection")
+            self._detect_gunshots_heuristic(audio, sample_rate)
+
+        except Exception as e:
+            print(f"[{self.video_id}] Gunshot detection error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _detect_gunshots_yamnet(self, audio: np.ndarray, sample_rate: int, model) -> None:
+        """Detect gunshots using YAMNet ML model."""
+        # Load class names for debugging
+        class_names = self._get_yamnet_class_names()
+
+        # YAMNet expects 16kHz audio
+        if sample_rate != 16000:
+            try:
+                import resampy
+                print(f"[{self.video_id}] Resampling audio from {sample_rate}Hz to 16000Hz...")
+                audio = resampy.resample(audio, sample_rate, 16000)
+                sample_rate = 16000
+            except ImportError:
+                print(f"[{self.video_id}] resampy not available, using scipy for resampling")
+                from scipy import signal
+                num_samples = int(len(audio) * 16000 / sample_rate)
+                audio = signal.resample(audio, num_samples)
+                sample_rate = 16000
+
+        # Process in sliding windows
+        window_samples = int(sample_rate * YAMNET_WINDOW_SEC)
+        hop_samples = window_samples // 2  # 50% overlap
+        last_alert_time = -GUNSHOT_COOLDOWN
+        alert_count = 0
+        loud_window_count = 0
+
+        audio_duration = len(audio) / sample_rate
+        print(f"[{self.video_id}] YAMNet: Analyzing {audio_duration:.1f}s of audio...")
+        print(f"[{self.video_id}] YAMNet: Window={YAMNET_WINDOW_SEC}s, Hop={hop_samples/sample_rate:.2f}s, Threshold={YAMNET_CONFIDENCE_THRESHOLD}")
+
+        for i in range(0, len(audio) - window_samples, hop_samples):
+            if self._stop_event.is_set():
+                break
+
+            chunk = audio[i:i + window_samples]
+            current_time = i / sample_rate
+            peak_amplitude = np.max(np.abs(chunk))
+
+            # Skip very quiet sections
+            if peak_amplitude < 0.1:
+                continue
+
+            loud_window_count += 1
+
+            # Check cooldown
+            if current_time - last_alert_time < GUNSHOT_COOLDOWN:
+                continue
+
+            # Run YAMNet inference
+            try:
+                scores, embeddings, spectrogram = model(chunk)
+                scores = scores.numpy()
+
+                # Average scores across all frames in this window
+                mean_scores = np.mean(scores, axis=0)
+
+                # Debug: print top 5 predictions for loud sounds (peak > 0.5)
+                if YAMNET_DEBUG and peak_amplitude > 0.5:
+                    top_indices = np.argsort(mean_scores)[-5:][::-1]
+                    top_preds = [(class_names.get(idx, f"class_{idx}"), mean_scores[idx]) for idx in top_indices]
+                    print(f"[{self.video_id}] YAMNet @ {current_time:.1f}s (peak={peak_amplitude:.2f}): "
+                          f"{', '.join([f'{name}:{conf:.2f}' for name, conf in top_preds])}")
+
+                    # Also show gunshot-related class scores
+                    gunshot_scores = [(YAMNET_GUNSHOT_CLASSES[idx], mean_scores[idx])
+                                     for idx in YAMNET_GUNSHOT_CLASSES.keys()]
+                    print(f"[{self.video_id}]   Gunshot classes: {', '.join([f'{name}:{conf:.3f}' for name, conf in gunshot_scores])}")
+
+                # Check for gunshot-related classes
+                for class_idx, class_name in YAMNET_GUNSHOT_CLASSES.items():
+                    confidence = mean_scores[class_idx]
+
+                    if confidence >= YAMNET_CONFIDENCE_THRESHOLD:
+                        # Determine sound type
+                        if class_idx in [427, 428, 429, 430, 431]:  # Gunshot classes
+                            sound_type = "SHOTS FIRED"
+                            description = f"ML detected: {class_name} (confidence={confidence:.2f})"
+                        elif class_idx == 426:  # Explosion
+                            sound_type = "EXPLOSION"
+                            description = f"ML detected: {class_name} (confidence={confidence:.2f})"
+                        elif class_idx == 494:  # Bang
+                            sound_type = "SHOTS FIRED"
+                            description = f"ML detected: {class_name} (confidence={confidence:.2f})"
+                        else:
+                            continue  # Skip non-critical detections
+
+                        alert_count += 1
+                        last_alert_time = current_time
+                        alert_text = f"⚠️ AUDIO: {sound_type}! {description}"
+                        self._emit(current_time, "action", alert_text)
+                        print(f"[{self.video_id}] *** ALERT @ {current_time:.1f}s: {sound_type} "
+                              f"(YAMNet: {class_name}, conf={confidence:.2f}) ***")
+                        break  # One alert per window
+
+            except Exception as e:
+                print(f"[{self.video_id}] YAMNet inference error at {current_time:.1f}s: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        print(f"[{self.video_id}] YAMNet complete: analyzed {loud_window_count} loud windows, {alert_count} alerts")
+
+    def _get_yamnet_class_names(self) -> dict:
+        """Get YAMNet class names from the model or use a cached version."""
+        if hasattr(self, '_yamnet_class_names'):
+            return self._yamnet_class_names
+
+        # Common YAMNet class names (subset of the 521 classes)
+        # Full list: https://storage.googleapis.com/audioset/yamnet/yamnet_class_map.csv
+        self._yamnet_class_names = {
+            0: "Speech",
+            1: "Child speech",
+            2: "Conversation",
+            3: "Narration",
+            4: "Babbling",
+            5: "Speech synthesizer",
+            6: "Shout",
+            7: "Bellow",
+            8: "Whoop",
+            9: "Yell",
+            10: "Children shouting",
+            11: "Screaming",
+            12: "Whispering",
+            13: "Laughter",
+            137: "Music",
+            288: "Vehicle",
+            420: "Thump",
+            421: "Thunk",
+            426: "Explosion",
+            427: "Gunshot, gunfire",
+            428: "Machine gun",
+            429: "Fusillade",
+            430: "Artillery fire",
+            431: "Cap gun",
+            494: "Bang",
+            495: "Slap",
+            496: "Whack",
+            500: "Finger snapping",
+            506: "Silence",
+            520: "Inside, small room",
+        }
+        return self._yamnet_class_names
+
+    def _detect_gunshots_heuristic(self, audio: np.ndarray, sample_rate: int) -> None:
+        """Fallback heuristic-based gunshot detection."""
+        chunk_samples = int(sample_rate * GUNSHOT_CHUNK_MS / 1000)
+        attack_samples = int(sample_rate * ATTACK_TIME_THRESHOLD_MS / 1000)
+        duration_samples = int(sample_rate * SOUND_DURATION_MAX_MS / 1000)
+        last_alert_time = -GUNSHOT_COOLDOWN
+        alert_count = 0
+
+        print(f"[{self.video_id}] Analyzing audio with heuristic detection...")
+
+        for i in range(0, len(audio) - chunk_samples, chunk_samples // 2):
+            if self._stop_event.is_set():
+                break
+
+            chunk = audio[i:i + chunk_samples]
+            current_time = i / sample_rate
+
+            abs_chunk = np.abs(chunk)
+            peak_amplitude = np.max(abs_chunk)
+            if peak_amplitude < 0.45:
+                continue
+
+            if current_time - last_alert_time < GUNSHOT_COOLDOWN:
+                continue
+
+            # Spectral analysis
+            spectrum = np.abs(np.fft.rfft(chunk))
+            freqs = np.fft.rfftfreq(len(chunk), 1 / sample_rate)
+            spectrum_sum = np.sum(spectrum) + 1e-10
+            spectral_centroid = np.sum(freqs * spectrum) / spectrum_sum
+
+            # Crest factor
+            rms = np.sqrt(np.mean(chunk ** 2)) + 1e-10
+            crest_factor = peak_amplitude / rms
+
+            # Attack time
+            peak_idx = np.argmax(abs_chunk)
+            threshold_20pct = peak_amplitude * 0.2
+            attack_start = peak_idx
+            for j in range(peak_idx, max(0, peak_idx - attack_samples * 2), -1):
+                if abs_chunk[j] < threshold_20pct:
+                    attack_start = j
+                    break
+            attack_time_ms = ((peak_idx - attack_start) / sample_rate) * 1000
+
+            # Duration
+            threshold_30pct = peak_amplitude * 0.3
+            duration_end = min(len(chunk), peak_idx + duration_samples)
+            for j in range(peak_idx, duration_end):
+                if abs_chunk[j] < threshold_30pct:
+                    duration_end = j
+                    break
+            sound_duration_ms = ((duration_end - attack_start) / sample_rate) * 1000
+
+            sound_type = None
+
+            # TASER detection
+            if spectral_centroid > TASER_FREQ_THRESHOLD and peak_amplitude > 0.50:
+                sound_type = "TASER FIRED"
+                description = f"Taser discharge (peak={peak_amplitude:.2f}, freq={spectral_centroid:.0f}Hz)"
+
+            # GUNSHOT detection
+            elif peak_amplitude >= GUNSHOT_AMPLITUDE_THRESHOLD:
+                is_freq_ok = GUNSHOT_FREQ_MIN <= spectral_centroid <= GUNSHOT_FREQ_MAX
+                is_impulsive = attack_time_ms <= ATTACK_TIME_THRESHOLD_MS
+                is_short = sound_duration_ms <= SOUND_DURATION_MAX_MS
+                is_crest_ok = crest_factor >= CREST_FACTOR_THRESHOLD
+
+                impulsive_checks_passed = sum([is_impulsive, is_short, is_crest_ok])
+                if is_freq_ok and impulsive_checks_passed >= 2:
+                    sound_type = "SHOTS FIRED"
+                    description = f"Gunshot (peak={peak_amplitude:.2f}, freq={spectral_centroid:.0f}Hz)"
+
+            if sound_type:
+                alert_count += 1
+                last_alert_time = current_time
+                alert_text = f"⚠️ AUDIO: {sound_type}! {description}"
+                self._emit(current_time, "action", alert_text)
+                print(f"[{self.video_id}] AUDIO @ {current_time:.1f}s: {sound_type}")
+
+        print(f"[{self.video_id}] Heuristic gunshot detection complete: {alert_count} alerts")
+
     def _process_video(self) -> None:
         """Main processing loop with parallel audio streaming and frame analysis."""
         conn = open_video_db()
@@ -401,6 +739,7 @@ class VideoStreamProcessor:
             duration = total_frames / fps if fps > 0 else 0
 
             print(f"[{self.video_id}] Processing video: {duration:.1f}s @ {fps:.1f}fps")
+            print(f"[{self.video_id}] Scene descriptions: {'enabled' if ENABLE_SCENE_DESCRIPTIONS else 'disabled'}")
             self._emit(0, "status", f"Processing video ({duration:.1f}s)")
             update_video_status(conn, self.video_id, "processing")
 
@@ -432,12 +771,25 @@ class VideoStreamProcessor:
                 transcribe_thread.start()
                 print(f"[{self.video_id}] Deepgram transcription thread started")
 
+            # Start gunshot detection in parallel
+            gunshot_thread = None
+            if wav_path:
+                print(f"[{self.video_id}] Starting audio gunshot detection...")
+                gunshot_thread = threading.Thread(
+                    target=self._detect_gunshots,
+                    args=(wav_path,),
+                    daemon=True,
+                )
+                gunshot_thread.start()
+                print(f"[{self.video_id}] Gunshot detection thread started")
+
             # Process frames at regular intervals (parallel with audio streaming)
             frame_interval_frames = int(fps * FRAME_INTERVAL)
             frame_count = 0
             last_context = ""
             first_frame_analyzed = False
             last_activity_time = 0.0  # Track when we last had real activity
+            last_emitted_time = 0.0  # Track when we last emitted ANY activity event (for 10s min interval)
             no_activity_start = None  # Track start of "no activity" period
             last_scene_time = -999.0  # Track when we last did a scene description
 
@@ -470,14 +822,15 @@ class VideoStreamProcessor:
                     continue
 
                 # Check if we should do a scene description (first frame or periodic)
-                should_describe_scene = is_first_frame or (current_time - last_scene_time >= SCENE_DESCRIPTION_INTERVAL)
+                if ENABLE_SCENE_DESCRIPTIONS:
+                    should_describe_scene = is_first_frame or (current_time - last_scene_time >= SCENE_DESCRIPTION_INTERVAL)
 
-                if should_describe_scene:
-                    scene_desc = self._analyze_scene(image_url)
-                    if scene_desc:
-                        self._emit(current_time, "scene", scene_desc)
-                        print(f"[{self.video_id}] SCENE @ {current_time:.1f}s: {scene_desc[:80]}...")
-                        last_scene_time = current_time
+                    if should_describe_scene:
+                        scene_desc = self._analyze_scene(image_url)
+                        if scene_desc:
+                            self._emit(current_time, "scene", scene_desc)
+                            print(f"[{self.video_id}] SCENE @ {current_time:.1f}s: {scene_desc[:80]}...")
+                            last_scene_time = current_time
 
                 # Get audio context for this time window (from live transcripts)
                 audio_context = self._get_transcripts_in_window(current_time)
@@ -488,11 +841,25 @@ class VideoStreamProcessor:
                     # Check if it's a "no activity" response
                     is_no_activity = self._is_no_activity_response(description)
 
-                    if is_no_activity:
+                    # Check if we need to force an update (10 second minimum interval)
+                    time_since_last_emit = current_time - last_emitted_time
+                    force_emit = time_since_last_emit >= MIN_ACTIVITY_INTERVAL
+
+                    if is_no_activity and not force_emit:
                         # Start or continue tracking no-activity period
                         if no_activity_start is None:
                             no_activity_start = last_activity_time if last_activity_time > 0 else current_time - FRAME_INTERVAL
                         print(f"[{self.video_id}] @ {current_time:.1f}s: (no activity)")
+                    elif is_no_activity and force_emit:
+                        # Force emit after 10 seconds - emit the no-activity range so far, then continue
+                        if no_activity_start is not None:
+                            self._emit_no_activity_range(no_activity_start, current_time)
+                            no_activity_start = current_time  # Start a new no-activity period
+                        else:
+                            # No period tracked yet, emit current state
+                            self._emit(current_time, "action", "Scene continues unchanged.")
+                        last_emitted_time = current_time
+                        print(f"[{self.video_id}] @ {current_time:.1f}s: (forced update after {time_since_last_emit:.0f}s)")
                     elif self._is_valid_response(description):
                         # Real activity - emit any pending no-activity period first
                         if no_activity_start is not None:
@@ -504,6 +871,7 @@ class VideoStreamProcessor:
                         print(f"[{self.video_id}] @ {current_time:.1f}s: {description[:60]}...")
                         last_context = description
                         last_activity_time = current_time
+                        last_emitted_time = current_time
                     else:
                         # Filtered but not "no activity" - log for debugging
                         print(f"[{self.video_id}] @ {current_time:.1f}s: (filtered) {description[:40]}...")
@@ -523,6 +891,11 @@ class VideoStreamProcessor:
             if transcribe_thread and transcribe_thread.is_alive():
                 print(f"[{self.video_id}] Waiting for Deepgram transcription to complete...")
                 transcribe_thread.join(timeout=60.0)  # 60 second timeout for transcription
+
+            # Wait for gunshot detection to finish
+            if gunshot_thread and gunshot_thread.is_alive():
+                print(f"[{self.video_id}] Waiting for gunshot detection to complete...")
+                gunshot_thread.join(timeout=30.0)
 
             self._emit(duration, "status", "Processing complete")
             update_video_status(conn, self.video_id, "done")
