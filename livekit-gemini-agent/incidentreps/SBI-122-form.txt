@@ -1,0 +1,260 @@
+TRAFFIC STOP REPORT
+
+Agency Name
+
+Date (Month/Day/Year)
+
+County of Stop
+
+Officer ID Number
+
+Time
+
+City of Stop
+Part I
+
+Initial Purpose of Traffic Stop (check only one)
+Checkpoint
+
+Other Motor Vehicle Violation
+
+Stop Light / Sign Violation
+
+Driving While Impaired
+
+Safe Movement Violation
+
+Vehicle Equipment Violation
+
+Investigation
+
+Seat Belt Violation
+
+Vehicle Regulatory Violation
+
+Speed Limit Violation
+
+Vehicle Driver Information
+Driver’s Age
+
+Driver’s Race
+
+White
+
+Driver’s Sex
+
+Male
+
+Female
+
+Driver’s Ethnicity
+
+NonHispanic
+
+Hispanic
+Hispanic
+
+Black
+
+Native
+American
+
+Asian
+
+Other
+
+(Person of Mexican, Puerto Rican, Cuban, Central,
+Central or South American, or other Spanish Culture)
+
+Enforcement Action Taken as a Result of the Traffic Stop (check only one)
+Citation Issued
+
+On-View Arrest
+
+If arrest made, who was arrested?
+
+No Action Taken
+
+Verbal Warning
+
+Driver
+
+Written Warning
+
+Passenger(s)
+
+Physical Resistance Encountered
+Did Officer(s) encounter any physical resistance from Driver and/or Passenger(s)?
+
+Yes
+
+No
+
+Did Officer(s) engage in the use of force against the Driver and/or Passenger(s)?
+
+Yes
+
+No
+
+Did injuries occur to the Officer(s) as a result of the stop?
+
+Yes
+
+No
+
+Did injuries occur to the Driver as a result of the stop?
+
+Yes
+
+No
+
+Did injuries occur to the Passenger(s) as a result of the stop?
+
+Yes
+
+No
+
+Yes*
+
+No
+
+Vehicle/Driver/Passenger(s) Search
+Was a search initiated subsequent to the traffic stop?
+*If search was initiated, complete Part II
+
+SBI-122 (Rev. 12/09)
+
+Traffic Stop Report
+Part II
+
+Type of Search (check only one)
+Consent
+
+Search Warrant
+
+Probable Cause
+
+Search Incident to Arrest
+
+Protective Frisk
+
+Basis for Search
+Erratic/Suspicious Behavior
+
+Observation of Suspected Contraband
+
+Suspicious Movement
+
+Informant’s Tip
+
+Other Official Information
+
+Witness Observation
+
+Person(s)/Vehicle Searched
+Yes
+Yes
+Yes
+Yes
+
+Was the Vehicle Searched?
+Was the Driver Searched?
+Was a Passenger(s) Searched?
+Were the Personal Effects of the Driver and/or Passenger(s) Searched?
+
+No
+No
+No
+No
+
+Identify the sex, race, and ethnicity of each passenger searched
+Age
+
+Sex
+Male
+
+Female
+
+Race
+White
+
+Black
+
+Ethnicity
+
+Native
+American
+
+Asian
+
+Other
+
+Hispanic
+
+NonHispanic
+
+Passenger 1
+Passenger 2
+Passenger 3
+Passenger 4
+
+Contraband Found
+Contraband found as a result of the search:
+
+None
+
+OR complete the following:
+
+Drugs
+
+Ounces
+
+Pounds
+
+Alcohol
+
+Pints
+
+Gallons
+
+Money
+
+Dollar Amount
+
+Weapons
+
+Number of Weapons
+
+Other
+
+Dollar Amount
+
+Dosages
+
+Grams
+
+Kilos
+
+Property Seized
+Property seized as a result of the search:
+Motor Vehicle
+
+Personal Property
+
+None
+
+OR complete the following:
+
+Other Property
+
+Office Use Only
+Reviewed
+Entered
+
+SBI-122 (Rev. 12/09)
+
+Date
+
+Initials
+
+

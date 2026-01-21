@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -23,8 +24,17 @@ load_dotenv(_env_path)
 from livekit.agents.llm import ChatContext, ImageContent
 from livekit.plugins import openai
 
-from video_store import insert_event, insert_video, list_events, list_videos, open_video_db, update_video_status
+from video_store import (
+    insert_event, insert_video, list_events, list_videos, open_video_db, update_video_status,
+    insert_report, list_reports, get_report, get_reports_for_video,
+    get_video_thumbnail, get_report_json_data, get_all_events, get_cached_report,
+    get_twelvelabs_video, upsert_twelvelabs_video, update_twelvelabs_status,
+    insert_report_note, list_report_notes, get_twelvelabs_video_by_hash
+)
+from report_generator import generate_report
+from formal_report_generator import generate_formal_report, detect_incident_type, FormalReportGenerator
 from video_stream_processor import get_audio_stream_processor, start_audio_stream_processing
+from twelvelabs_client import TwelveLabsClient, extract_generated_text
 
 
 UPLOAD_DIR = os.getenv("VIDEO_UPLOAD_DIR", "uploads")
@@ -167,6 +177,108 @@ def _parse_multipart(content_type: str, body: bytes) -> dict[str, tuple[str, byt
             result[field_name] = (filename, payload)
 
     return result
+
+
+def _file_sha256(path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _queue_twelvelabs_indexing(video_id: str, video_path: str, content_hash: str | None) -> None:
+    twelvelabs = TwelveLabsClient()
+    if not twelvelabs.enabled:
+        return
+    if not twelvelabs.index_id:
+        print("[TwelveLabs] TWELVELABS_INDEX_ID is not set; skipping indexing")
+        return
+
+    conn = open_video_db()
+    existing = get_twelvelabs_video(conn, video_id)
+    if existing:
+        conn.close()
+        return
+
+    if content_hash:
+        dup = get_twelvelabs_video_by_hash(conn, content_hash)
+        if dup and dup.get("tl_video_id"):
+            upsert_twelvelabs_video(
+                conn,
+                video_id=video_id,
+                tl_index_id=dup.get("tl_index_id") or twelvelabs.index_id,
+                tl_task_id=dup.get("tl_task_id"),
+                tl_video_id=dup.get("tl_video_id"),
+                content_hash=content_hash,
+                status=dup.get("status") or "ready",
+                error=None,
+            )
+            conn.close()
+            print(f"[TwelveLabs] Reusing existing video {dup.get('tl_video_id')} for {video_id}")
+            return
+        if dup and dup.get("tl_task_id") and str(dup.get("status", "")).lower() not in {"error"}:
+            upsert_twelvelabs_video(
+                conn,
+                video_id=video_id,
+                tl_index_id=dup.get("tl_index_id") or twelvelabs.index_id,
+                tl_task_id=dup.get("tl_task_id"),
+                tl_video_id=dup.get("tl_video_id"),
+                content_hash=content_hash,
+                status=dup.get("status") or "processing",
+                error=None,
+            )
+            conn.close()
+            print(f"[TwelveLabs] Reusing in-flight task {dup.get('tl_task_id')} for {video_id}")
+            return
+
+    upsert_twelvelabs_video(
+        conn,
+        video_id=video_id,
+        tl_index_id=twelvelabs.index_id,
+        tl_task_id=None,
+        tl_video_id=None,
+        content_hash=content_hash,
+        status="processing",
+        error=None,
+    )
+    conn.close()
+
+    def _worker() -> None:
+        result = twelvelabs.start_indexing(video_path)
+        conn = open_video_db()
+        if not result.ok:
+            update_twelvelabs_status(
+                conn,
+                video_id=video_id,
+                status="error",
+                error=result.error,
+            )
+            conn.close()
+            print(f"[TwelveLabs] Indexing failed for {video_id}: {result.error}")
+            return
+
+        data = result.data or {}
+        task_id = data.get("task_id") or data.get("id")
+        tl_video_id = data.get("video_id")
+        status = str(data.get("status") or "processing")
+        upsert_twelvelabs_video(
+            conn,
+            video_id=video_id,
+            tl_index_id=twelvelabs.index_id,
+            tl_task_id=task_id,
+            tl_video_id=tl_video_id,
+            content_hash=content_hash,
+            status=status,
+            error=None,
+        )
+        conn.close()
+        print(f"[TwelveLabs] Indexing queued for {video_id} (task {task_id})")
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 async def _describe_frame(image_data_url: str, prompt: str, max_tokens: int) -> str:
@@ -483,7 +595,20 @@ class VideoHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self._send_cors_headers()
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _read_json_body(self) -> dict | None:
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length <= 0:
+            return None
+        body = self.rfile.read(content_length)
+        try:
+            return json.loads(body.decode("utf-8"))
+        except Exception:
+            return None
 
     def do_OPTIONS(self) -> None:
         """Handle CORS preflight requests."""
@@ -624,6 +749,362 @@ class VideoHandler(BaseHTTPRequestHandler):
                 return
             self._send_file(path)
             return
+        # List all reports endpoint
+        if parsed.path == "/api/reports":
+            try:
+                conn = open_video_db()
+                payload = {"reports": list_reports(conn)}
+                conn.close()
+                self._send_json(payload)
+            except Exception as e:
+                print(f"Error listing reports: {e}")
+                self._send_json({"error": str(e), "reports": []}, status=500)
+            return
+        # Get stored report by ID
+        if parsed.path.startswith("/api/stored-report/"):
+            report_id = parsed.path.split("/api/stored-report/")[1]
+            try:
+                conn = open_video_db()
+                report = get_report(conn, report_id)
+                conn.close()
+                if not report:
+                    self._send_json({"error": "Report not found"}, status=404)
+                    return
+                # Return the stored report data
+                if report["format"] == "json":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self._send_cors_headers()
+                    data = report["report_data"].encode("utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                else:  # html
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self._send_cors_headers()
+                    data = report["report_data"].encode("utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+            except Exception as e:
+                print(f"Error getting report {report_id}: {e}")
+                self._send_json({"error": str(e)}, status=500)
+            return
+        # Get reports for a specific video
+        if parsed.path.startswith("/api/video-reports/"):
+            video_id = parsed.path.split("/api/video-reports/")[1]
+            try:
+                conn = open_video_db()
+                reports = get_reports_for_video(conn, video_id)
+                conn.close()
+                self._send_json({"reports": reports})
+            except Exception as e:
+                print(f"Error getting reports for video {video_id}: {e}")
+                self._send_json({"error": str(e), "reports": []}, status=500)
+            return
+        # Video thumbnail endpoint
+        if parsed.path.startswith("/api/thumbnail/"):
+            video_id = parsed.path.split("/api/thumbnail/")[1]
+            try:
+                conn = open_video_db()
+                thumbnail = get_video_thumbnail(conn, video_id)
+                conn.close()
+                if not thumbnail:
+                    self._send_json({"error": "No thumbnail available"}, status=404)
+                    return
+                # Return the base64 image data
+                self._send_json({"thumbnail": thumbnail})
+            except Exception as e:
+                print(f"Error getting thumbnail for {video_id}: {e}")
+                self._send_json({"error": str(e)}, status=500)
+            return
+        # Report data endpoint (returns parsed JSON for frontend consumption)
+        if parsed.path.startswith("/api/report-data/"):
+            report_id = parsed.path.split("/api/report-data/")[1]
+            try:
+                conn = open_video_db()
+                # First try to get existing report
+                report = get_report(conn, report_id)
+                if not report:
+                    conn.close()
+                    self._send_json({"error": "Report not found"}, status=404)
+                    return
+                # If it's a JSON report, parse and return
+                if report["format"] == "json":
+                    import json as json_module
+                    try:
+                        data = json_module.loads(report["report_data"])
+                        conn.close()
+                        self._send_json(data)
+                        return
+                    except json_module.JSONDecodeError:
+                        pass
+                # For HTML reports or failed JSON parse, regenerate as JSON
+                video_id = report["video_id"]
+                conn.close()
+                report_json = generate_report(video_id, "json")
+                self._send_json(json.loads(report_json))
+            except Exception as e:
+                print(f"Error getting report data {report_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                self._send_json({"error": str(e)}, status=500)
+            return
+        # Report notes endpoint (QA additional info)
+        if parsed.path.startswith("/api/report-notes/"):
+            report_id = parsed.path.split("/api/report-notes/")[1]
+            try:
+                conn = open_video_db()
+                report = get_report(conn, report_id)
+                if not report:
+                    conn.close()
+                    self._send_json({"error": "Report not found"}, status=404)
+                    return
+                video_id = report["video_id"]
+                tl_meta = get_twelvelabs_video(conn, video_id)
+                if tl_meta and tl_meta.get("tl_task_id") and str(tl_meta.get("status", "")).lower() not in {"ready", "indexed", "completed"}:
+                    twelvelabs = TwelveLabsClient()
+                    if twelvelabs.enabled:
+                        status_result = twelvelabs.get_task(tl_meta["tl_task_id"])
+                        if status_result.ok and status_result.data:
+                            update_twelvelabs_status(
+                                conn,
+                                video_id=video_id,
+                                status=str(status_result.data.get("status") or "processing"),
+                                tl_video_id=status_result.data.get("video_id"),
+                                tl_task_id=status_result.data.get("task_id"),
+                                error=None,
+                            )
+                            tl_meta = get_twelvelabs_video(conn, video_id)
+                notes = list_report_notes(conn, video_id=video_id)
+                conn.close()
+                payload = {
+                    "notes": notes,
+                    "twelvelabs": {
+                        "status": tl_meta["status"] if tl_meta else None,
+                        "error": tl_meta["error"] if tl_meta else None,
+                        "updated_at": tl_meta["updated_at"] if tl_meta else None,
+                    },
+                }
+                self._send_json(payload)
+            except Exception as e:
+                print(f"Error getting report notes {report_id}: {e}")
+                self._send_json({"error": str(e), "notes": []}, status=500)
+            return
+        # Report generation endpoint (generates AND stores)
+        if parsed.path.startswith("/api/report/"):
+            video_id = parsed.path.split("/api/report/")[1]
+            params = parse_qs(parsed.query)
+            format_type = params.get("format", ["json"])[0]
+            save_report = params.get("save", ["true"])[0].lower() == "true"
+            force_regenerate = params.get("force", ["false"])[0].lower() == "true"
+            try:
+                conn = open_video_db()
+
+                # Check for cached report first (unless force regenerate)
+                cached = None
+                if not force_regenerate:
+                    cached = get_cached_report(conn, video_id, "standard")
+
+                if cached:
+                    print(f"[{video_id}] Returning cached report: {cached['id']}")
+                    report_id = cached["id"]
+                    report_json = cached["report_data"]
+
+                    # Generate requested format from cached JSON
+                    if format_type == "html":
+                        from report_generator import ReportGenerator
+                        generator = ReportGenerator(video_id)
+                        generator._report_data = json.loads(report_json)
+                        report_data = generator.to_html()
+                    else:
+                        report_data = report_json
+                else:
+                    # Generate new report
+                    from report_generator import ReportGenerator
+                    generator = ReportGenerator(video_id)
+                    report_dict = generator.compile_report_data()
+                    report_json = json.dumps(report_dict, indent=2)
+
+                    if format_type == "html":
+                        report_data = generator.to_html()
+                    else:
+                        report_data = report_json
+
+                    # Store the report if save=true (default)
+                    report_id = None
+                    if save_report:
+                        report_id = f"RPT-{uuid.uuid4().hex[:8].upper()}"
+                        insert_report(
+                            conn,
+                            report_id=report_id,
+                            video_id=video_id,
+                            report_data=report_json,
+                            format_type="json",
+                        )
+                        print(f"[{video_id}] Report saved: {report_id}")
+
+                conn.close()
+
+                if format_type == "json":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self._send_cors_headers()
+                    if report_id:
+                        self.send_header("X-Report-ID", report_id)
+                    self.send_header("Content-Disposition", f'attachment; filename="report_{video_id}.json"')
+                    data = report_data.encode("utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                elif format_type == "html":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self._send_cors_headers()
+                    if report_id:
+                        self.send_header("X-Report-ID", report_id)
+                    self.send_header("Content-Disposition", f'attachment; filename="report_{video_id}.html"')
+                    data = report_data.encode("utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(data)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+                else:
+                    self._send_json({"error": f"Unsupported format: {format_type}"}, status=400)
+            except ValueError as e:
+                self._send_json({"error": str(e)}, status=404)
+            except Exception as e:
+                print(f"Report generation error: {e}")
+                import traceback
+                traceback.print_exc()
+                self._send_json({"error": "Report generation failed"}, status=500)
+            return
+
+        # Detect incident type endpoint
+        if parsed.path.startswith("/api/incident-type/"):
+            video_id = parsed.path.split("/api/incident-type/")[1]
+            try:
+                incident_type = detect_incident_type(video_id)
+                self._send_json({
+                    "video_id": video_id,
+                    "incident_type": incident_type,
+                    "incident_type_label": incident_type.replace("_", " ").title()
+                })
+            except ValueError as e:
+                self._send_json({"error": str(e)}, status=404)
+            except Exception as e:
+                print(f"Incident type detection error: {e}")
+                self._send_json({"error": str(e)}, status=500)
+            return
+
+        # Formal police report generation endpoint
+        if parsed.path.startswith("/api/formal-report/"):
+            video_id = parsed.path.split("/api/formal-report/")[1]
+            params = parse_qs(parsed.query)
+            format_type = params.get("format", ["json"])[0]
+            report_type = params.get("type", ["auto"])[0]  # auto, traffic_stop, ois, general
+            save_report = params.get("save", ["true"])[0].lower() == "true"
+            force_regenerate = params.get("force", ["false"])[0].lower() == "true"
+
+            try:
+                conn = open_video_db()
+
+                # Check for cached report first (unless force regenerate)
+                cached = None
+                if not force_regenerate:
+                    cached = get_cached_report(conn, video_id, report_type)
+
+                if cached:
+                    print(f"[{video_id}] Returning cached formal report: {cached['id']}")
+                    report_id = cached["id"]
+                    report_data = json.loads(cached["report_data"])
+
+                    # Format output from cached data
+                    if format_type == "html":
+                        generator = FormalReportGenerator(video_id)
+                        generator._report_data = report_data
+                        output_data = generator.to_html()
+                        content_type = "text/html"
+                        file_ext = "html"
+                    else:
+                        output_data = cached["report_data"]
+                        content_type = "application/json"
+                        file_ext = "json"
+                else:
+                    print(f"[{video_id}] Generating formal {report_type} report...")
+                    generator = FormalReportGenerator(video_id)
+
+                    # Generate the appropriate report based on type
+                    if report_type == "traffic_stop":
+                        report_data = generator.generate_traffic_stop_report()
+                    elif report_type == "ois" or report_type == "officer_involved":
+                        report_data = generator.generate_officer_involved_incident_report()
+                    elif report_type == "general":
+                        report_data = generator.generate_general_incident_report()
+                    else:
+                        # Auto-detect
+                        report_data = generator.generate_appropriate_report()
+
+                    # Format output
+                    if format_type == "html":
+                        output_data = generator.to_html()
+                        content_type = "text/html"
+                        file_ext = "html"
+                    else:
+                        output_data = json.dumps(report_data, indent=2)
+                        content_type = "application/json"
+                        file_ext = "json"
+
+                    # Save report if requested
+                    report_id = None
+                    if save_report:
+                        report_id = report_data.get("report_id", f"FR-{uuid.uuid4().hex[:8].upper()}")
+                        insert_report(
+                            conn,
+                            report_id=report_id,
+                            video_id=video_id,
+                            report_data=json.dumps(report_data, indent=2),
+                            format_type="json",  # Always save JSON for reuse
+                        )
+                        print(f"[{video_id}] Formal report saved: {report_id}")
+
+                conn.close()
+
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self._send_cors_headers()
+                if report_id:
+                    self.send_header("X-Report-ID", report_id)
+                self.send_header("Content-Disposition", f'attachment; filename="formal_report_{video_id}.{file_ext}"')
+                data = output_data.encode("utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+            except ValueError as e:
+                self._send_json({"error": str(e)}, status=404)
+            except Exception as e:
+                print(f"Formal report generation error: {e}")
+                import traceback
+                traceback.print_exc()
+                self._send_json({"error": "Formal report generation failed"}, status=500)
+            return
+
         self.send_error(404)
 
     def do_POST(self) -> None:
@@ -651,6 +1132,78 @@ class VideoHandler(BaseHTTPRequestHandler):
                 "stream_url": f"/api/audio/stream/{video_id}",
             })
             return
+        if self.path.startswith("/api/report-qa/"):
+            report_id = self.path.split("/api/report-qa/")[1]
+            body = self._read_json_body() or {}
+            question = str(body.get("question", "")).strip()
+            if not question:
+                self._send_json({"error": "missing question"}, status=400)
+                return
+
+            conn = open_video_db()
+            report = get_report(conn, report_id)
+            if not report:
+                conn.close()
+                self._send_json({"error": "Report not found"}, status=404)
+                return
+
+            video_id = report["video_id"]
+            tl_meta = get_twelvelabs_video(conn, video_id)
+            twelvelabs = TwelveLabsClient()
+            if not twelvelabs.enabled:
+                conn.close()
+                self._send_json({"error": "TwelveLabs is not configured"}, status=400)
+                return
+
+            if tl_meta and tl_meta.get("tl_task_id") and str(tl_meta.get("status", "")).lower() not in {"ready", "indexed", "completed"}:
+                status_result = twelvelabs.get_task(tl_meta["tl_task_id"])
+                if status_result.ok and status_result.data:
+                    update_twelvelabs_status(
+                        conn,
+                        video_id=video_id,
+                        status=str(status_result.data.get("status") or "processing"),
+                        tl_video_id=status_result.data.get("video_id"),
+                        tl_task_id=status_result.data.get("task_id"),
+                        error=None,
+                    )
+                    tl_meta = get_twelvelabs_video(conn, video_id)
+
+            if not tl_meta or not tl_meta.get("tl_video_id"):
+                conn.close()
+                self._send_json({"error": "TwelveLabs video is not ready yet"}, status=409)
+                return
+
+            if str(tl_meta.get("status", "")).lower() not in {"ready", "indexed", "completed"}:
+                conn.close()
+                self._send_json({"error": "TwelveLabs video is still processing"}, status=409)
+                return
+
+            result = twelvelabs.generate_answer(tl_meta["tl_video_id"], question)
+            if not result.ok:
+                conn.close()
+                self._send_json({"error": result.error or "TwelveLabs QA failed"}, status=500)
+                return
+
+            answer = extract_generated_text(result.data) or "No answer returned."
+            note_id = insert_report_note(
+                conn,
+                report_id=report_id,
+                video_id=video_id,
+                question=question,
+                answer=answer,
+                source="twelvelabs_chat",
+            )
+            conn.close()
+            self._send_json({
+                "note": {
+                    "id": note_id,
+                    "report_id": report_id,
+                    "question": question,
+                    "answer": answer,
+                    "source": "twelvelabs_chat",
+                }
+            })
+            return
         if self.path != "/upload":
             self.send_error(404)
             return
@@ -670,6 +1223,7 @@ class VideoHandler(BaseHTTPRequestHandler):
         dst_path = os.path.join(UPLOAD_DIR, f"{video_id}.mp4")
         with open(dst_path, "wb") as f:
             f.write(file_data)
+        content_hash = _file_sha256(dst_path)
         cap = cv2.VideoCapture(dst_path)
         duration = _video_duration(cap)
         cap.release()
@@ -678,6 +1232,7 @@ class VideoHandler(BaseHTTPRequestHandler):
         conn = open_video_db()
         insert_video(conn, video_id, os.path.basename(filename), duration)
         conn.close()
+        _queue_twelvelabs_indexing(video_id, dst_path, content_hash)
 
         # Use the new stream processor if enabled
         if USE_STREAM_PROCESSOR:

@@ -1,8 +1,18 @@
 """
 Video processor that analyzes frames using GPT-4o-mini Vision API
-and streams audio to Deepgram's live API for real-time transcription.
+with parallel audio processing for:
+- Gunshot/taser detection using YAMNet ML model (with heuristic fallback)
+- Speech transcription using OpenAI Whisper and/or Deepgram
 
-Transcripts and visual analysis happen in parallel for live updates.
+All processing happens in parallel for real-time SSE streaming:
+- Video frames analyzed every 3 seconds
+- Audio gunshot detection runs concurrently
+- Transcription runs concurrently (OpenAI Whisper + Deepgram)
+
+Configuration via environment variables:
+- TRANSCRIPTION_PROVIDER: 'openai', 'deepgram', 'both', or 'none' (default: 'both')
+- DEEPGRAM_API_KEY: Required for Deepgram transcription
+- OPENAI_API_KEY: Required for both vision analysis and Whisper transcription
 """
 
 import base64
@@ -20,7 +30,7 @@ import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from video_store import insert_event, open_video_db, update_video_status
+from video_store import insert_event, insert_screenshot, open_video_db, update_video_status
 
 # Load environment
 _env_path = os.path.join(os.path.dirname(__file__), ".env.local")
@@ -72,59 +82,81 @@ YAMNET_GUNSHOT_CLASSES = {
 # Minimum activity update interval - force emit even during quiet periods
 MIN_ACTIVITY_INTERVAL = 10.0  # At least one activity update every 10 seconds
 
-# System prompt for video analysis - event-focused, not frame-descriptive
-SYSTEM_PROMPT = """You are a body cam footage event logger. Your job is to describe what is happening in each moment.
+# Transcription settings
+TRANSCRIPTION_PROVIDER = os.getenv("TRANSCRIPTION_PROVIDER", "both")  # 'openai', 'deepgram', 'both', or 'none'
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+TRANSCRIPTION_CHUNK_SEC = 30  # Process audio in 30-second chunks for transcription
 
-!!! HIGHEST PRIORITY - ALERTS !!!
-If you see ANY of these, START your response with the alert in ALL CAPS:
+# Screenshot capture settings for police reports
+SCREENSHOT_PERIODIC_INTERVAL = 30.0  # Capture periodic screenshot every 30 seconds
+CRITICAL_KEYWORDS = [
+    "GUN DRAWN", "TASER DRAWN", "TASER FIRED", "SHOTS FIRED",
+    "WEAPON!", "GUN VISIBLE", "GUN POINTED",
+    "CAMERA BLOCKED", "CAMERA OBSCURED",
+    "PERSON ON FLOOR", "PERSON DOWN", "PERSON PRONE",
+    "AUDIO: SHOTS FIRED", "AUDIO: TASER FIRED", "AUDIO: EXPLOSION",
+]
 
-WEAPONS:
-- GUN DRAWN: "⚠️ GUN DRAWN! Officer/Subject draws firearm..."
-- TASER DRAWN: "⚠️ TASER DRAWN! Officer deploys taser..."
-- TASER FIRED: "⚠️ TASER FIRED! Taser discharged at subject..."
-- SHOTS FIRED: "⚠️ SHOTS FIRED! Gunfire detected..."
-- KNIFE/WEAPON: "⚠️ WEAPON! Subject brandishes knife/weapon..."
-- GUN VISIBLE: "⚠️ GUN VISIBLE! Firearm seen on subject's person..."
-- GUN POINTED: "⚠️ GUN POINTED! Weapon aimed at..."
+# Critical presence tracking (avoid repeating the same warning every frame)
+CRITICAL_PRESENCE_CLEAR_SEC = float(os.getenv("CRITICAL_PRESENCE_CLEAR_SEC", "6"))
+CRITICAL_CATEGORY_KEYWORDS = {
+    "gun": ["GUN DRAWN", "GUN VISIBLE", "GUN POINTED", "WEAPON!"],
+    "taser": ["TASER DRAWN", "TASER FIRED"],
+    "camera": ["CAMERA BLOCKED", "CAMERA OBSCURED"],
+    "person_down": ["PERSON ON FLOOR", "PERSON DOWN", "PERSON PRONE"],
+    # Shots fired is treated as a discrete event, not persistent presence
+}
 
-CAMERA STATUS:
-- CAMERA BLOCKED: "⚠️ CAMERA BLOCKED! View obstructed by hand/object/darkness..."
-- CAMERA OBSCURED: "⚠️ CAMERA OBSCURED! Partial obstruction, limited visibility..."
+# System prompt for video analysis - describe what's happening
+SYSTEM_PROMPT = """You are analyzing FIRST-PERSON body camera footage worn by a police officer.
 
-PERSON DOWN:
-- PERSON ON FLOOR: "⚠️ PERSON ON FLOOR! Individual lying on ground/floor..."
-- PERSON DOWN: "⚠️ PERSON DOWN! Subject fallen/taken down..."
-- PERSON PRONE: "⚠️ PERSON PRONE! Individual face-down on ground..."
+PERSPECTIVE AWARENESS:
+- This is POV footage from a camera on the OFFICER'S chest/shoulder
+- The officer wearing the camera is NOT visible except for their hands/arms/weapon
+- Camera movement = officer movement (walking, turning, taking cover)
+- The officer's voice is typically the closest/clearest audio
+- Everyone else visible in frame are SUBJECTS, CIVILIANS, or OTHER OFFICERS
 
-ALSO CALL OUT:
-- AGGRESSIVE ACTIONS: Lunging, striking, charging, fighting, resisting
-- PHYSICAL ALTERCATION: Any physical contact between officer and subject
+!!! CRITICAL ALERTS - ALWAYS START WITH THESE !!!
+If you see ANY of these, START with the alert:
+- GUN DRAWN/VISIBLE/POINTED: "⚠️ GUN DRAWN! Officer draws weapon..." or "⚠️ GUN VISIBLE! Subject has weapon..."
+- TASER DRAWN/FIRED: "⚠️ TASER FIRED! ..."
+- SHOTS FIRED: "⚠️ SHOTS FIRED! ..."
+- WEAPON VISIBLE: "⚠️ WEAPON! ..."
+- PERSON DOWN/PRONE: "⚠️ PERSON DOWN! ..."
+- CAMERA BLOCKED: "⚠️ CAMERA BLOCKED! ..."
 
-RULES:
-- ALWAYS describe what people are doing: standing, walking, talking, gesturing, looking around
-- Log positions: "Officer stands by driver door", "Subject seated in vehicle"
-- Log interactions: conversations, handoffs, pointing, approaching, backing away
-- NEVER start with "In this frame" - just state what's happening
-- Use active voice: "Officer speaks with driver" not "The officer is speaking"
-- Be concise: 1-2 sentences
-- Use third person: 'the officer', 'the subject', 'the individual'
+DESCRIBE BOTH:
+1. OFFICER (camera wearer) actions - inferred from:
+   - Hands/arms visible in frame (reaching, pointing, holding weapon)
+   - Camera movement (approaching, retreating, turning)
+   - Voice/commands given (if audio provided)
 
-GOOD: "⚠️ TASER DRAWN! Officer draws taser, subject backs away with hands up."
-GOOD: "⚠️ GUN DRAWN! Officer unholsters service weapon, takes cover position."
-GOOD: "Officer stands at driver window speaking with occupant."
-BAD: "No new activity" (always describe what you see, even if routine)
+2. SUBJECT(S) actions - what others are doing:
+   - Their movements, positions, compliance
+   - Responses to officer commands
+   - Demeanor and behavior
 
-You are logging a continuous record of events - describe what's visible even during calm moments."""
+STYLE:
+- 2-4 sentences: first describe OFFICER action, then SUBJECT response
+- Active voice: "Officer approaches vehicle. Subject exits with hands raised."
+- Be specific about positions, movements, and compliance level
+- Distinguish officer's weapon vs subject's weapon clearly"""
 
 # Separate prompt for scene descriptions - used at start and periodically
-SCENE_PROMPT = """Describe the scene and people in plain text, no markdown or bullet points.
+SCENE_PROMPT = """Describe the scene from this FIRST-PERSON body camera footage. No markdown or bullet points.
 
-Include: Location type, then each person with their role, clothing colors/types, build, hair, and position.
+REMEMBER: This is POV from the officer's body camera. The camera-wearing officer is NOT visible (except their hands/weapon).
+
+Structure your description:
+1. LOCATION: Type of location, lighting, key features
+2. OFFICER (camera wearer): Only describe what's visible - hands, weapon drawn/holstered, any equipment visible
+3. SUBJECTS/OTHERS: Each person visible with role (subject, civilian, backup officer), clothing colors, build, position relative to camera
 
 Example format:
-"Interior residence, stairway with yellow walls. Officer in dark blue uniform and tactical vest, medium build, hair in bun, standing on stairs. Male subject in light blue shirt and dark pants, slim build, short hair, at top of stairs facing officer."
+"Nighttime traffic stop on residential street, patrol vehicle lights illuminating scene. Officer's right hand visible resting on holstered weapon. Male subject (driver) standing outside white sedan, Hispanic male, early 30s, wearing gray hoodie and jeans, hands visible at sides, approximately 8 feet from camera. Female passenger remaining seated in vehicle, blonde hair, blue top visible through window."
 
-Write as a single flowing paragraph. Be specific about clothing colors for identification."""
+Write as a flowing paragraph. Be specific about clothing colors and positions for identification."""
 
 # Scene description settings
 ENABLE_SCENE_DESCRIPTIONS = os.getenv("ENABLE_SCENE_DESCRIPTIONS", "1") == "1"
@@ -163,6 +195,11 @@ class VideoStreamProcessor:
         self._event_queue: queue.Queue[VideoEvent | None] = queue.Queue()
         self._stop_event = threading.Event()
         self._processing_thread: threading.Thread | None = None
+        # Buffer for recent transcripts (for context during frame analysis)
+        self._recent_transcripts: list[tuple[float, str]] = []  # (offset_sec, text)
+        self._transcript_lock = threading.Lock()
+        # Track active critical presence (gun/camera blocked/etc)
+        self._active_critical: dict[str, float] = {}
 
     def start(self) -> None:
         """Start processing in a background thread."""
@@ -216,6 +253,66 @@ class VideoStreamProcessor:
         except Exception as e:
             print(f"[{self.video_id}] Failed to save event: {e}")
 
+        # If this is a transcript, add to recent buffer for frame context
+        if kind == "transcript":
+            self._add_transcript_to_buffer(offset, text)
+
+    def _refresh_active_critical(self, current_time: float) -> None:
+        if not hasattr(self, "_active_critical"):
+            self._active_critical = {}
+            return
+        to_clear = [
+            category
+            for category, last_seen in self._active_critical.items()
+            if current_time - last_seen >= CRITICAL_PRESENCE_CLEAR_SEC
+        ]
+        for category in to_clear:
+            self._active_critical.pop(category, None)
+
+    def _extract_critical_categories(self, text: str) -> set[str]:
+        text_upper = text.upper()
+        categories = set()
+        for category, keywords in CRITICAL_CATEGORY_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text_upper:
+                    categories.add(category)
+                    break
+        return categories
+
+    def _strip_active_critical_prefixes(self, text: str, categories: set[str]) -> str:
+        cleaned = text
+        for category in categories:
+            keywords = CRITICAL_CATEGORY_KEYWORDS.get(category, [])
+            for keyword in keywords:
+                pattern = r"^\\s*⚠️\\s*" + re.escape(keyword) + r"!\\s*"
+                cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+        return cleaned.strip()
+
+    def _add_transcript_to_buffer(self, offset_sec: float, text: str) -> None:
+        """Add a transcript segment to the recent buffer."""
+        with self._transcript_lock:
+            # Remove provider prefix for cleaner context
+            clean_text = text
+            for prefix in ["[OpenAI] ", "[Deepgram] "]:
+                if clean_text.startswith(prefix):
+                    clean_text = clean_text[len(prefix):]
+                    break
+            self._recent_transcripts.append((offset_sec, clean_text))
+            # Keep only last 30 seconds of transcripts
+            cutoff = offset_sec - 30.0
+            self._recent_transcripts = [
+                (t, txt) for t, txt in self._recent_transcripts if t >= cutoff
+            ]
+
+    def _get_recent_transcript_context(self, current_time: float, lookback_sec: float = 10.0) -> str:
+        """Get transcript text from the last N seconds for context."""
+        with self._transcript_lock:
+            cutoff = current_time - lookback_sec
+            recent = [txt for t, txt in self._recent_transcripts if t >= cutoff and t <= current_time]
+            if not recent:
+                return ""
+            return " ".join(recent)
+
 
     def _encode_frame(self, frame_bgr: np.ndarray) -> str:
         """Encode frame to base64 data URL."""
@@ -231,17 +328,105 @@ class VideoStreamProcessor:
         data = base64.b64encode(buf).decode("ascii")
         return f"data:image/jpeg;base64,{data}"
 
-    def _analyze_frame_with_audio(self, image_url: str, visual_context: str = "") -> str:
-        """Analyze a frame with optional prior visual context."""
+    def _is_critical_event(self, text: str) -> bool:
+        """Check if text contains critical keywords that warrant a screenshot."""
+        text_upper = text.upper()
+        for keyword in CRITICAL_KEYWORDS:
+            if keyword in text_upper:
+                return True
+        return False
+
+    def _capture_screenshot(self, frame_bgr: np.ndarray, offset_sec: float, trigger_type: str) -> None:
+        """Capture and save a screenshot to the database."""
+        try:
+            # Encode frame at higher quality for screenshots
+            h, w = frame_bgr.shape[:2]
+            max_size = 800  # Higher resolution for report screenshots
+            if w > max_size or h > max_size:
+                scale = min(max_size / w, max_size / h)
+                new_w, new_h = int(w * scale), int(h * scale)
+                frame_bgr = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not ok:
+                print(f"[{self.video_id}] Failed to encode screenshot")
+                return
+
+            image_data = f"data:image/jpeg;base64,{base64.b64encode(buf).decode('ascii')}"
+
+            conn = open_video_db()
+            screenshot_id = insert_screenshot(
+                conn,
+                video_id=self.video_id,
+                offset_sec=offset_sec,
+                trigger_type=trigger_type,
+                image_data=image_data,
+            )
+            conn.close()
+            print(f"[{self.video_id}] SCREENSHOT #{screenshot_id} @ {offset_sec:.1f}s ({trigger_type})")
+        except Exception as e:
+            print(f"[{self.video_id}] Failed to capture screenshot: {e}")
+
+    def _analyze_frame_with_audio(
+        self,
+        image_url: str,
+        visual_context: str = "",
+        audio_context: str = "",
+        full_description: bool = False
+    ) -> str:
+        """
+        Analyze a frame focusing on CHANGES from previous state.
+
+        Args:
+            image_url: Base64 encoded frame
+            visual_context: Previous visual description
+            audio_context: Recent transcript/dialogue
+            full_description: If True, give full scene description (for periodic updates)
+        """
         prompt_parts = []
 
-        if visual_context:
-            prompt_parts.append(f"Previous event logged: {visual_context}")
+        if full_description:
+            # FULL DESCRIPTION MODE - used periodically or for first frame
+            prompt_parts.append(
+                "Provide a FULL scene description (4-5 sentences). Remember this is FIRST-PERSON body cam:\n"
+                "- OFFICER (camera wearer): What are their hands doing? Weapon drawn/holstered? Movement?\n"
+                "- SUBJECTS: Position, actions, demeanor of each person visible\n"
+                "- ENVIRONMENT: Location type, lighting, obstacles, vehicles\n"
+                "- INTERACTION: How are officer and subjects engaging?"
+            )
+            if audio_context:
+                prompt_parts.append(f'AUDIO CONTEXT (officer or subject speaking): "{audio_context}"')
+                prompt_parts.append("Who is speaking? How are others responding to the dialogue/commands?")
+            max_tokens = 400
+        else:
+            # INCREMENTAL MODE - describe current state, focusing on what's different
+            if visual_context:
+                prompt_parts.append(f"PREVIOUS: {visual_context}")
+                prompt_parts.append(
+                    "Describe what is happening NOW. Focus on changes in:\n"
+                    "- Officer's position/actions (hands, movement, weapon)\n"
+                    "- Subject's response/compliance/movement"
+                )
+            else:
+                prompt_parts.append(
+                    "Describe what is happening. Remember: camera = officer's POV.\n"
+                    "What is the OFFICER doing (hands visible, movement)?\n"
+                    "What are SUBJECTS doing (position, compliance)?"
+                )
 
-        prompt_parts.append(
-            "Describe what is happening. What are people doing? Any movement, gestures, or interaction? "
-            "If truly nothing has changed from the previous log (same positions, no movement), say: No new activity"
-        )
+            if audio_context:
+                prompt_parts.append(f'AUDIO (spoken by officer or subject): "{audio_context}"')
+                prompt_parts.append(
+                    "Identify who is speaking (officer giving command? subject responding?).\n"
+                    "Describe physical reactions to what was said."
+                )
+                # Always describe something when there's audio - it's context worth noting
+                max_tokens = 250
+            else:
+                prompt_parts.append(
+                    "If the scene is essentially static with no movement from officer or subjects, say: NO_CHANGE"
+                )
+                max_tokens = 180
 
         prompt = "\n\n".join(prompt_parts)
 
@@ -258,7 +443,7 @@ class VideoStreamProcessor:
                         ],
                     },
                 ],
-                max_tokens=200,
+                max_tokens=max_tokens,
                 temperature=0.3,
             )
             return response.choices[0].message.content.strip()
@@ -599,6 +784,153 @@ class VideoStreamProcessor:
 
         print(f"[{self.video_id}] Heuristic gunshot detection complete: {alert_count} alerts")
 
+    def _transcribe_with_openai(self, wav_path: str) -> None:
+        """Transcribe audio using OpenAI Whisper API."""
+        print(f"[{self.video_id}] Starting OpenAI Whisper transcription...")
+
+        try:
+            # Read the audio file
+            with open(wav_path, "rb") as audio_file:
+                # Use OpenAI Whisper API with timestamps
+                response = self._client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
+                )
+
+            # Process segments with timestamps
+            if hasattr(response, 'segments') and response.segments:
+                for segment in response.segments:
+                    # Segments are objects with attributes, not dicts
+                    start_time = getattr(segment, 'start', 0)
+                    text = getattr(segment, 'text', '').strip()
+
+                    if text and len(text) > 2:
+                        self._emit(start_time, "transcript", f"[OpenAI] {text}")
+                        print(f"[{self.video_id}] TRANSCRIPT (OpenAI) @ {start_time:.1f}s: {text[:60]}...")
+            elif hasattr(response, 'text') and response.text:
+                # Fallback if no segments available
+                self._emit(0, "transcript", f"[OpenAI] {response.text}")
+                print(f"[{self.video_id}] TRANSCRIPT (OpenAI): {response.text[:60]}...")
+
+            print(f"[{self.video_id}] OpenAI Whisper transcription complete")
+
+        except Exception as e:
+            print(f"[{self.video_id}] OpenAI transcription error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _transcribe_with_deepgram(self, wav_path: str) -> None:
+        """Transcribe audio using Deepgram REST API directly."""
+        if not DEEPGRAM_API_KEY:
+            print(f"[{self.video_id}] Deepgram API key not configured, skipping Deepgram transcription")
+            return
+
+        print(f"[{self.video_id}] Starting Deepgram transcription...")
+
+        try:
+            import requests
+
+            # Read the audio file
+            with open(wav_path, "rb") as audio_file:
+                audio_data = audio_file.read()
+
+            # Deepgram REST API endpoint with query parameters
+            url = "https://api.deepgram.com/v1/listen"
+            params = {
+                "model": "nova-2",
+                "smart_format": "true",
+                "punctuate": "true",
+                "paragraphs": "true",  # Get sentence-level timestamps
+                "utterances": "true",
+                "utt_split": "0.2",  # Split on 0.2s silence (high sensitivity)
+            }
+
+            headers = {
+                "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                "Content-Type": "audio/wav",
+            }
+
+            # Make the request - send raw audio data
+            print(f"[{self.video_id}] Sending {len(audio_data)} bytes to Deepgram...")
+            response = requests.post(url, params=params, headers=headers, data=audio_data, timeout=120)
+
+            if response.status_code != 200:
+                print(f"[{self.video_id}] Deepgram API error: {response.status_code} - {response.text}")
+                return
+
+            data = response.json()
+            print(f"[{self.video_id}] Deepgram response received")
+
+            # Process results
+            results = data.get("results", {})
+            channels = results.get("channels", [])
+
+            # First try to get sentences from paragraphs (most granular)
+            sentences_emitted = False
+            if channels:
+                for channel in channels:
+                    alternatives = channel.get("alternatives", [])
+                    if alternatives:
+                        alt = alternatives[0]
+                        paragraphs_data = alt.get("paragraphs", {})
+                        paragraphs_list = paragraphs_data.get("paragraphs", [])
+
+                        if paragraphs_list:
+                            print(f"[{self.video_id}] Deepgram: Found {len(paragraphs_list)} paragraphs with sentences")
+                            for para in paragraphs_list:
+                                sentences = para.get("sentences", [])
+                                for sentence in sentences:
+                                    start_time = sentence.get("start", 0)
+                                    text = sentence.get("text", "").strip()
+
+                                    if text and len(text) > 2:
+                                        self._emit(start_time, "transcript", f"[Deepgram] {text}")
+                                        print(f"[{self.video_id}] TRANSCRIPT (Deepgram) @ {start_time:.1f}s: {text[:60]}...")
+                                        sentences_emitted = True
+
+            # Fall back to utterances if no sentences
+            if not sentences_emitted:
+                utterances = results.get("utterances", [])
+                if utterances:
+                    print(f"[{self.video_id}] Deepgram: Found {len(utterances)} utterances")
+                    for utterance in utterances:
+                        start_time = utterance.get("start", 0)
+                        text = utterance.get("transcript", "").strip()
+
+                        if text and len(text) > 2:
+                            self._emit(start_time, "transcript", f"[Deepgram] {text}")
+                            print(f"[{self.video_id}] TRANSCRIPT (Deepgram) @ {start_time:.1f}s: {text[:60]}...")
+                elif channels:
+                    # Final fallback to full transcript
+                    print(f"[{self.video_id}] Deepgram: Using full transcript fallback")
+                    for channel in channels:
+                        alternatives = channel.get("alternatives", [])
+                        if alternatives:
+                            transcript = alternatives[0].get("transcript", "")
+                            if transcript:
+                                self._emit(0, "transcript", f"[Deepgram] {transcript}")
+                                print(f"[{self.video_id}] TRANSCRIPT (Deepgram) full: {transcript[:60]}...")
+
+            print(f"[{self.video_id}] Deepgram transcription complete")
+
+        except Exception as e:
+            print(f"[{self.video_id}] Deepgram transcription error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _run_transcription(self, wav_path: str) -> None:
+        """Run OpenAI transcription only (Deepgram runs separately before video analysis)."""
+        if TRANSCRIPTION_PROVIDER == "none":
+            print(f"[{self.video_id}] Transcription disabled")
+            return
+
+        print(f"[{self.video_id}] Running OpenAI transcription...")
+
+        if TRANSCRIPTION_PROVIDER in ("openai", "both"):
+            self._transcribe_with_openai(wav_path)
+
     def _process_video(self) -> None:
         """Main processing loop with parallel audio streaming and frame analysis."""
         conn = open_video_db()
@@ -626,6 +958,14 @@ class VideoStreamProcessor:
             self._emit(0, "status", "Extracting audio...")
             wav_path = self._extract_audio()
 
+            # Run Deepgram transcription FIRST (before video analysis)
+            # This pre-loads transcripts so they're ready when video plays
+            if wav_path and TRANSCRIPTION_PROVIDER in ("deepgram", "both"):
+                print(f"[{self.video_id}] Pre-loading Deepgram transcription...")
+                self._emit(0, "status", "Loading Deepgram transcription...")
+                self._transcribe_with_deepgram(wav_path)
+                print(f"[{self.video_id}] Deepgram transcription pre-loaded")
+
             # Start gunshot detection in parallel
             gunshot_thread = None
             if wav_path:
@@ -638,6 +978,18 @@ class VideoStreamProcessor:
                 gunshot_thread.start()
                 print(f"[{self.video_id}] Gunshot detection thread started")
 
+            # Start OpenAI transcription in parallel (runs alongside video analysis)
+            transcription_thread = None
+            if wav_path and TRANSCRIPTION_PROVIDER in ("openai", "both"):
+                print(f"[{self.video_id}] Starting OpenAI transcription...")
+                transcription_thread = threading.Thread(
+                    target=self._run_transcription,
+                    args=(wav_path,),
+                    daemon=True,
+                )
+                transcription_thread.start()
+                print(f"[{self.video_id}] OpenAI transcription thread started")
+
             # Process frames at regular intervals (parallel with audio streaming)
             frame_interval_frames = int(fps * FRAME_INTERVAL)
             frame_count = 0
@@ -647,6 +999,7 @@ class VideoStreamProcessor:
             last_emitted_time = 0.0  # Track when we last emitted ANY activity event (for 10s min interval)
             no_activity_start = None  # Track start of "no activity" period
             last_scene_time = -999.0  # Track when we last did a scene description
+            last_screenshot_time = -999.0  # Track when we last took a periodic screenshot
 
             self._emit(0, "status", "Analyzing video frames...")
 
@@ -686,8 +1039,56 @@ class VideoStreamProcessor:
                             self._emit(current_time, "scene", scene_desc)
                             print(f"[{self.video_id}] SCENE @ {current_time:.1f}s: {scene_desc[:80]}...")
                             last_scene_time = current_time
+                            # Capture screenshot for scene description
+                            self._capture_screenshot(frame, current_time, "scene")
+                            last_screenshot_time = current_time
 
-                description = self._analyze_frame_with_audio(image_url, last_context)
+                # Get recent transcript context (last 5 seconds for tighter relevance)
+                audio_context = self._get_recent_transcript_context(current_time, lookback_sec=5.0)
+
+                # Determine if we need a FULL description vs change detection
+                # Full description: first frame OR every 30 seconds
+                need_full_description = is_first_frame or (int(current_time) % 30 == 0 and int(current_time) > 0)
+
+                description = self._analyze_frame_with_audio(
+                    image_url,
+                    visual_context=last_context,
+                    audio_context=audio_context,
+                    full_description=need_full_description
+                )
+
+                if audio_context:
+                    print(f"[{self.video_id}] @ {current_time:.1f}s: Audio: \"{audio_context[:40]}...\"")
+
+                # Handle NO_CHANGE response - skip emitting
+                if description and description.strip().upper() == "NO_CHANGE":
+                    print(f"[{self.video_id}] @ {current_time:.1f}s: (no change)")
+                    continue
+
+                # Track critical presence so we don't repeat the same warning each frame
+                self._refresh_active_critical(current_time)
+                if description:
+                    categories = self._extract_critical_categories(description)
+                    if categories:
+                        newly_active = {c for c in categories if c not in self._active_critical}
+                        for category in categories:
+                            self._active_critical[category] = current_time
+                        if newly_active:
+                            already_active = categories - newly_active
+                            if already_active:
+                                description = self._strip_active_critical_prefixes(description, already_active)
+                        else:
+                            description = self._strip_active_critical_prefixes(description, categories)
+                        if not description:
+                            print(f"[{self.video_id}] @ {current_time:.1f}s: (critical already active, skipping)")
+                            continue
+
+                # Check if description is too similar to previous (AI didn't say NO_CHANGE but repeated itself)
+                # BUT always emit critical events even if similar
+                if description and last_context and not self._is_critical_event(description):
+                    if self._is_similar_to_previous(description, last_context):
+                        print(f"[{self.video_id}] @ {current_time:.1f}s: (similar to previous, skipping)")
+                        continue
 
                 if description:
                     # Check if it's a "no activity" response
@@ -724,6 +1125,15 @@ class VideoStreamProcessor:
                         last_context = description
                         last_activity_time = current_time
                         last_emitted_time = current_time
+
+                        # Capture screenshot for critical events
+                        if self._is_critical_event(description):
+                            self._capture_screenshot(frame, current_time, "critical")
+                            last_screenshot_time = current_time
+                        # Capture periodic screenshot every SCREENSHOT_PERIODIC_INTERVAL seconds
+                        elif current_time - last_screenshot_time >= SCREENSHOT_PERIODIC_INTERVAL:
+                            self._capture_screenshot(frame, current_time, "periodic")
+                            last_screenshot_time = current_time
                     else:
                         # Filtered but not "no activity" - log for debugging
                         print(f"[{self.video_id}] @ {current_time:.1f}s: (filtered) {description[:40]}...")
@@ -743,6 +1153,11 @@ class VideoStreamProcessor:
             if gunshot_thread and gunshot_thread.is_alive():
                 print(f"[{self.video_id}] Waiting for gunshot detection to complete...")
                 gunshot_thread.join(timeout=30.0)
+
+            # Wait for transcription to finish
+            if transcription_thread and transcription_thread.is_alive():
+                print(f"[{self.video_id}] Waiting for transcription to complete...")
+                transcription_thread.join(timeout=60.0)  # Transcription may take longer
 
             self._emit(duration, "status", "Processing complete")
             update_video_status(conn, self.video_id, "done")
@@ -767,28 +1182,50 @@ class VideoStreamProcessor:
             self._stop_event.set()
 
     def _is_no_activity_response(self, text: str) -> bool:
-        """Check if response indicates no new activity - balanced matching."""
+        """Check if response is ONLY a 'no activity' stub with no real description."""
         text_lower = text.lower().strip()
 
-        # Too short to be meaningful
-        if len(text_lower) < 15:
+        # Too short to be meaningful (less than 10 chars)
+        if len(text_lower) < 10:
             return True
 
-        # Check if the response STARTS with a no-activity phrase
-        # This catches "No new activity." but not "Officer stands still, no new activity since last update."
-        no_activity_starts = [
-            "no new activity",
-            "no activity",
-            "no change",
-            "nothing new",
-            "scene unchanged",
-            "no movement",
+        # Check for no-change indicators
+        no_change_phrases = [
+            "no_change", "no change", "no new activity", "no activity",
+            "nothing new", "scene unchanged", "no movement",
+            "no significant change", "nothing has changed"
         ]
-        for phrase in no_activity_starts:
-            if text_lower.startswith(phrase):
+
+        for phrase in no_change_phrases:
+            if text_lower == phrase or text_lower == phrase + ".":
                 return True
 
         return False
+
+    def _is_similar_to_previous(self, new_text: str, prev_text: str, threshold: float = 0.7) -> bool:
+        """Check if new description is too similar to previous (avoid repetition)."""
+        if not prev_text or not new_text:
+            return False
+
+        # Normalize texts
+        new_words = set(new_text.lower().split())
+        prev_words = set(prev_text.lower().split())
+
+        # Remove common words that don't indicate real similarity
+        stop_words = {"the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "and", "of", "with"}
+        new_words -= stop_words
+        prev_words -= stop_words
+
+        if not new_words or not prev_words:
+            return False
+
+        # Jaccard similarity
+        intersection = len(new_words & prev_words)
+        union = len(new_words | prev_words)
+
+        similarity = intersection / union if union > 0 else 0
+
+        return similarity > threshold
 
     def _emit_no_activity_range(self, start_time: float, end_time: float) -> None:
         """Emit a no-activity event showing the time range."""
